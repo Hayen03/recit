@@ -1,0 +1,13 @@
+/target
+
+/baks
+
+*.DS_Store
+
+*.codex
+
+/ignore
+
+*.tmp
+
+/python

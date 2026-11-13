@@ -1,0 +1,44 @@
+[package]
+name = "recit"
+version = "2.6.0"
+edition = "2021"
+description = "Moteur et forge TUI pour récits textuels JSON/JSON5 en français"
+license = "MIT"
+repository = "https://github.com/Hayen03/recit"
+readme = "./readme.md"
+rust-version = "1.87"
+documentation = "https://hayen.ca/docs/recit/recit/index.html"
+
+[[bin]]
+name = "recit"
+path = "src/main.rs"
+
+# [[bin]]
+# name = "recit-v1-vers-v2"
+# path = "src/bin/recit_v1_to_v2.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+indexmap = { version = "2.2", features = ["serde"] }
+rand = "0.8"
+rand_chacha = "0.3"
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_json5 = "0.2.1"
+lazy_static = "1.5.0"
+ratatui-image = { version = "11.0.7", features = ["crossterm"], default-features = false}
+image = { version = "0.25.*", features = ["png", "jpeg", "webp"] }
+reqwest = { version = "0.13.*", features = ["blocking"]}
+base64 = "0.23.*"
+viuer = { version = "0.11.0", features = [] }
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
