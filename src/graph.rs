@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
-use crate::formula::has_formula_substitution;
+use formulas::has_formula_substitution;
 
 const FORMULA_CONNECTION_TARGET: &str = "${connexion_formule}";
 const GLOBAL_PRE_SOURCE: &str = "@global:avant";

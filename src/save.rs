@@ -5,7 +5,7 @@
 //! the currently loaded tale and does not replay page effects.
 use crate::character::{Character, SavedCharacter};
 use crate::engine::{Message, PageProgress};
-use crate::formula::{Env, EvalValue};
+use formulas::{Env, EvalValue};
 use crate::model::Tale;
 use anyhow::{Context, Result};
 use indexmap::IndexMap;

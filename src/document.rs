@@ -12,7 +12,8 @@ use std::{
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::{formula::has_formula_substitution, parse_tale_text};
+use crate::{parse_tale_text};
+use formulas::has_formula_substitution;
 
 /// Wraps parsed tale data while tracking its file path and dirty state.
 #[derive(Debug, Clone)]

@@ -6,8 +6,9 @@
 use crate::character::Character;
 use crate::effects::{Cell, Deferred, PageEffect};
 use crate::error_report::format_error;
-use crate::formula::builtins::GLOBAL_ENV;
-use crate::formula::{Env, EvalValue, FormulaClosure, FormulaEngine, Function};
+use crate::formula::{mk_character_base_env, mk_character_env, mk_condition_env, mk_page_env};
+use formulas::builtins::GLOBAL_ENV;
+use formulas::{Env, EvalKey, EvalValue, FormulaClosure, FormulaEngine, Function};
 use crate::images::{ImageRegistry, ImageResult, fit_in_terminal};
 use crate::model::{CheckResult, Page, PageResult, Tale, eval_cells};
 use crate::polls::{PollRequest, PollRequestData};
@@ -15,7 +16,7 @@ use crate::save::{SavedPageProgress, load_state, save_state};
 use anyhow::{anyhow, Context, Result};
 use crossterm::cursor::MoveToNextLine;
 use crossterm::execute;
-use indexmap::{IndexMap, IndexSet};
+use indexmap::{IndexMap};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write, stdout};
@@ -418,8 +419,7 @@ impl Game {
                     Function::User(
                         FormulaClosure { 
                             definition: value.clone(), 
-                            captures: IndexMap::new().into(), 
-                            tale_globals: IndexSet::new().into(),
+                            captures: IndexMap::new().into(),
                         }
                     ).into()
                 ));
@@ -532,7 +532,7 @@ impl Game {
         base_map.insert("connexion".into(), EvalValue::Object(IndexMap::new().into()));
         base_map.insert("test".into(), EvalValue::Null);
         let base_env = Env::from_index_map(&base_map);
-        Ok(character.base_env(formula, &base_env.merged(env))
+        Ok(mk_character_base_env(character, formula, &base_env.merged(env))
             .with_context(|| "Construction de l'environnement initial du personnage")?
             .expand(base_env))
     }
@@ -579,7 +579,10 @@ impl Game {
                         Character::new_with_tags(
                             &self.tale.attributes,
                             Some(name.into()),
-                            &self.tale.initial_tags,
+                            &self.tale.initial_tags
+                                .iter()
+                                .map(|(k, v)| (EvalKey(k.clone().into()), v.clone()))
+                                .collect(),
                         ),
                         Some(self.tale.start.clone()),
                         None,
@@ -663,24 +666,21 @@ impl Game {
             {
                 continue;
             }
-            let denv = character
-                .env(&mut self.formula, &base_env)
+            let denv = mk_character_env(character, &mut self.formula, &base_env)
                 .with_context(|| format!("Construction de l'environnement pour évaluer les effets de la cellule {}", cell_context()))?
                 .with_parent(&base_env);
             let effects = PageEffect::eval_many(&cell.effects, &mut self.formula, &denv)
                 .with_context(|| format!("Construction des effets de la {}", cell_context()))?;
             for (effect_index, effect) in effects.into_iter().enumerate() {
                 if matches!(&effect, crate::effects::PageEffect::Poll { .. }) {
-                    let charenv = character
-                        .env(&mut self.formula, &base_env)
+                    let charenv = mk_character_env(character, &mut self.formula, &base_env)
                         .with_context(|| format!("Préparation de l'effet #{} de la {}", effect_index + 1, cell_context()))?
                         .with_parent(base_env);
                     progress
                         .show(None, &mut self.terminal, &mut self.tale.images, &self.client, &mut self.formula, &charenv)
                         .with_context(|| format!("Affichage avant le sondage de la {}", cell_context()))?;
                 }
-                let env = character
-                    .env(&mut self.formula, base_env)
+                let env = mk_character_env(character, &mut self.formula, base_env)
                     .with_context(|| format!("Préparation de l'effet #{} de la {}", effect_index + 1, cell_context()))?
                     .with_parent(&base_env);
                 let effect_kind = effect.kind();
@@ -717,8 +717,7 @@ impl Game {
                     break;
                 }
             }
-            let charenv = character
-                .env(&mut self.formula, &base_env)
+            let charenv = mk_character_env(character, &mut self.formula, &base_env)
                 .with_context(|| format!("Construction de l'environnement du texte de la {}", cell_context()))?;
             let env = charenv.merged(&base_env);
             if let Some(text) = cell.text.clone() {
@@ -759,7 +758,7 @@ impl Game {
         next_page: &mut Option<Arc<str>>,
     ) -> Result<()> {
         let conditions = character.conditions.clone();
-        for condition in conditions {
+        for (idx, condition) in conditions.iter().enumerate() {
             if next_page.is_some() {
                 break;
             }
@@ -770,24 +769,13 @@ impl Game {
             };
             let condition_id = condition.template.id.clone();
             let phase = if before_page { "avant" } else { "apres" };
-            let charenv = character
-                .env(&mut self.formula, &env)
+            let charenv = mk_character_env(character, &mut self.formula, &env)
                 .with_context(|| {
                     format!("Environnement des cellules `{phase}` de l'état `{condition_id}`")
                 })?;
             let base_env = charenv.merged(&env);
 
-            let mut condition_env = Env::new();
-            condition_env.insert(
-                "condition",
-                EvalValue::Object(
-                    condition
-                        .resolved_metadata(&mut self.formula, &base_env)
-                        .with_context(|| format!("Métadonnées de l'état `{condition_id}`"))?
-                    .into(),
-                ),
-            );
-            let condition_env = condition_env.with_parent(&base_env);
+            let condition_env = mk_condition_env(&base_env, idx)?.with_parent(&base_env);
             let cells = eval_cells(&cells, &mut self.formula, &condition_env)
                 .with_context(|| format!("Erreur en évaluant les cellules de l'état {}", condition_id))?;
             if cells.is_empty() {
@@ -862,8 +850,7 @@ impl Game {
             // Page tags are entry-time constants. Deliberately expose only the
             // incoming connection tags, its resolved test, and tale globals here.
             let tag_env = Env::merge(&[&cenv, &connection_env, &tenv]);
-            let penv = page
-                .env(&mut self.formula, &tag_env)
+            let penv = mk_page_env(page, &mut self.formula, &tag_env)
                 .with_context(|| {
                     format!(
                         "Évaluation des tags immuables de la page `{}`",
@@ -875,8 +862,7 @@ impl Game {
             let cenv = Env::merge(&[&base_env, &tenv]);
             // Connection cells
             {
-                let phase_env = character
-                    .env(&mut self.formula, &cenv)
+                let phase_env = mk_character_env(character, &mut self.formula, &cenv)
                     .context("Environnement des cellules de connexion")?
                     .with_parent(&cenv);
                 let cells = eval_cells(&added_cells, &mut self.formula, &phase_env)
@@ -894,8 +880,7 @@ impl Game {
             
             // tale pre cells
             {
-                let phase_env = character
-                    .env(&mut self.formula, &cenv)
+                let phase_env = mk_character_env(character, &mut self.formula, &cenv)
                     .context("Environnement des cellules globales `avant`")?
                     .with_parent(&cenv);
                 let cells = eval_cells(&self.tale.pre, &mut self.formula, &phase_env)
@@ -924,8 +909,7 @@ impl Game {
 
             // page cells
             {
-                let phase_env = character
-                    .env(&mut self.formula, &cenv)
+                let phase_env = mk_character_env(character, &mut self.formula, &cenv)
                     .context("Environnement des cellules de la page")?
                     .with_parent(&cenv);
                 let cells = eval_cells(&page.cells, &mut self.formula, &phase_env)
@@ -954,8 +938,7 @@ impl Game {
 
             // tale post cells
             {
-                let phase_env = character
-                    .env(&mut self.formula, &cenv)
+                let phase_env = mk_character_env(character, &mut self.formula, &cenv)
                     .context("Environnement des cellules globales `apres`")?
                     .with_parent(&cenv);
                 let cells = eval_cells(&self.tale.post, &mut self.formula, &phase_env)
@@ -980,7 +963,7 @@ impl Game {
 
         // work env
         let wenv = Env::merge(&[&tenv, &base_env]);
-        let final_base_env = character.env(&mut self.formula, &wenv)
+        let final_base_env = mk_character_env(character, &mut self.formula, &wenv)
             .with_context(|| format!("Erreur lors de l'évaluation de l'environement final pour la page {}", page.id))?
             .with_parent(&base_env)
             .solidified(); // final base environment that will be returned to the next page, including character state and page env
@@ -1147,7 +1130,7 @@ impl Game {
         progress: &mut PageProgress,
         env: &Env,
     ) -> Result<()> {
-        let base_env = character.base_env(&mut self.formula, &env)?.with_parent(&env);
+        let base_env = mk_character_base_env(character, &mut self.formula, &env)?.with_parent(&env);
         let mut expired_indices = Vec::new();
         for (index, condition) in character.conditions.iter().enumerate() {
             if condition
@@ -1162,7 +1145,7 @@ impl Game {
 
         let mut removed = 0;
         let mut death_page = None;
-        let base_env = character.base_env(&mut self.formula, &env)?.with_parent(&env);
+        let base_env = mk_character_base_env(character, &mut self.formula, &env)?.with_parent(&env);
         for original_index in expired_indices {
             let index = original_index - removed;
             let condition = character.conditions.remove(index);
@@ -1176,7 +1159,7 @@ impl Game {
             character.fix_hp(&mut self.formula, &base_env)?;
             character.fix_morale(&mut self.formula, &base_env)?;
             if !character.is_alive() && death_page.is_none() {
-                let env = condition.env(&mut self.formula, &base_env)?.with_parent(&base_env);
+                let env = mk_condition_env(&base_env, original_index)?.with_parent(&base_env);
                 death_page = condition.template.death.as_ref().map(|d| self.formula.fmt_value(&d, &env)).transpose()?;
             } else if character.is_alive() {
                 death_page = None;
@@ -1324,8 +1307,7 @@ impl Game {
             self.terminal.reset()
         );
         if let Some(custom) = &self.tale.custom_status {
-            let charenv = character
-                .env(&mut self.formula, &env)
+            let charenv = mk_character_env(character, &mut self.formula, &env)
                 .context("Construction de l'environnement de l'écran de statut")?;
             let env = charenv.with_parent(&env);
             let resolved_string = self
@@ -1381,8 +1363,7 @@ impl Game {
         if character.conditions.is_empty() {
             println!("Vous n'avez aucun état.");
         } else {
-            let base_env = character
-                .env(&mut self.formula, &env)
+            let base_env = mk_character_env(character, &mut self.formula, &env)
                 .context("Construction de l'environnement de l'écran des états")?
                 .with_parent(&env);
             for condition in &character.conditions {
@@ -1420,8 +1401,7 @@ impl Game {
         if character.inventory.is_empty() {
             println!("Vous n'avez aucun objet.");
         } else {
-            let base_env = character
-                .env(&mut self.formula, &env)
+            let base_env = mk_character_env(character, &mut self.formula, &env)
                 .context("Construction de l'environnement de l'inventaire")?
                 .with_parent(&env);
             for (stack_index, stack) in character.inventory.iter().enumerate() {
@@ -1468,8 +1448,7 @@ impl Game {
             println!("Aucun tag narratif.");
         } else {
             for (tag, value) in character.story_tags.iter() {
-                let json = value.to_json()?;
-                let rendered = serde_json::to_string_pretty(&json)?;
+                let rendered = value.pretty_print();
                 if rendered.contains('\n') {
                     println!("{tag}:\n{rendered}");
                 } else {
@@ -1918,8 +1897,8 @@ use std::sync::Arc;
 use super::{
         Game, Interaction, PageProgress, Terminal, COMMANDS, DEBUG_COMMAND
     };
-    use crate::character::Character;
-    use crate::formula::{Env, EvalValue};
+    use crate::{character::Character, formula::{mk_character_base_env, mk_character_env, mk_page_env}};
+    use formulas::{Env, EvalKey, EvalValue};
     use crate::model::{Tale, eval_cells};
     use anyhow::Result;
     use indexmap::IndexMap;
@@ -2025,10 +2004,10 @@ use super::{
 
     #[test]
     fn highlighted_text_accepts_interpolated_color_strings() {
-        let mut formula = crate::formula::FormulaEngine::new(Some(1));
+        let mut formula = formulas::FormulaEngine::new(Some(1));
         let mut env = Env::new();
-        env.insert_json("couleur", &json!("#44CC88"));
-        env.insert_json("pv", &json!(7));
+        env.insert("couleur", EvalValue::Int(0x44CC88));
+        env.insert("pv", 7.into());
         let text = formula
             .format("$[${couleur}|PV : ${pv}]".into(), &env)
             .unwrap();
@@ -2077,7 +2056,7 @@ use super::{
 
         let env = Game::initial_env(&mut game.formula, &character, &game.tale.env()).unwrap();
         let env = game.tale.env()
-            .expand(page.env(&mut game.formula, &env).unwrap())
+            .expand(mk_page_env(&page, &mut game.formula, &env).unwrap())
             .with_parent(&env);
 
         let cells = eval_cells(&cells, &mut game.formula, &env).unwrap();
@@ -2091,7 +2070,7 @@ use super::{
         )
         .unwrap();
 
-        assert_eq!(character.story_tags.get("nombre"), Some(&EvalValue::Int(7)));
+        assert_eq!(character.story_tags.get(&EvalKey("nombre".into())), Some(&EvalValue::Int(7)));
         assert!(next_page.is_none());
     }
 
@@ -2141,7 +2120,7 @@ use super::{
 
         let env = Game::initial_env(&mut game.formula, &character, &game.tale.env()).unwrap();
         let env = game.tale.env()
-            .expand(page.env(&mut game.formula, &env).unwrap())
+            .expand(mk_page_env(&page, &mut game.formula, &env).unwrap())
             .with_parent(&env);
 
         let cells = eval_cells(&cells, &mut game.formula, &env).unwrap();
@@ -2157,15 +2136,15 @@ use super::{
         .unwrap();
 
         assert_eq!(
-            character.story_tags.get("premiere"),
+            character.story_tags.get(&EvalKey("premiere".into())),
             Some(&EvalValue::Int(2))
         );
         assert_eq!(
-            character.story_tags.get("seconde"),
+            character.story_tags.get(&EvalKey("seconde".into())),
             Some(&EvalValue::Int(5))
         );
 
-        let cenv = character.base_env(&mut game.formula, &env).unwrap();
+        let cenv = mk_character_base_env(&character, &mut game.formula, &env).unwrap();
         let env = env.expand(cenv);
 
         let (_title, rendered) = progress
@@ -2213,7 +2192,7 @@ use super::{
 
         let env = Game::initial_env(&mut game.formula, &character, &game.tale.env()).unwrap();
         let env = game.tale.env()
-            .expand(page.env(&mut game.formula, &env).unwrap())
+            .expand(mk_page_env(&page, &mut game.formula, &env).unwrap())
             .with_parent(&env);
 
         let cells = eval_cells(&cells, &mut game.formula, &env).unwrap();
@@ -2228,7 +2207,7 @@ use super::{
         )
         .unwrap();
 
-        assert_eq!(character.story_tags.get("gnomes"), Some(&EvalValue::Int(7)));
+        assert_eq!(character.story_tags.get(&EvalKey("gnomes".into())), Some(&EvalValue::Int(7)));
     }
 
     /// Verifies that deferred page cells and effects receive the current character environment.
@@ -2258,14 +2237,15 @@ use super::{
         let mut character = Character::new_with_tags(
             &game.tale.attributes,
             Some("Lene".into()),
-            &game.tale.initial_tags,
+            &game.tale.initial_tags.iter()
+                .map(|(k, v)| (EvalKey(k.clone().into()), v.clone()))
+                .collect(),
         );
         let tale_env = game.tale.env();
         let entry_env = Env::new();
-        let page_env = page.env(&mut game.formula, &tale_env).unwrap();
+        let page_env = mk_page_env(&page, &mut game.formula, &tale_env).unwrap();
         let base_env = Env::merge(&[&entry_env, &page_env, &tale_env]);
-        let phase_env = character
-            .env(&mut game.formula, &base_env)
+        let phase_env = mk_character_env(&character, &mut game.formula, &base_env)
             .unwrap()
             .with_parent(&base_env);
         let cells = eval_cells(&page.cells, &mut game.formula, &phase_env).unwrap();
@@ -2281,8 +2261,8 @@ use super::{
         )
         .unwrap();
 
-        assert_eq!(character.story_tags.get("cellule"), Some(&EvalValue::Int(3)));
-        assert_eq!(character.story_tags.get("effet"), Some(&EvalValue::Int(4)));
+        assert_eq!(character.story_tags.get(&EvalKey("cellule".into())), Some(&EvalValue::Int(3)));
+        assert_eq!(character.story_tags.get(&EvalKey("effet".into())), Some(&EvalValue::Int(4)));
     }
 
     // Verifies state lifecycle cells and their resolved `condition` environment.
@@ -2332,11 +2312,11 @@ use super::{
         let template = game.tale.conditions["brulure"].clone();
         let env = Game::initial_env(&mut game.formula, &character, &game.tale.env()).unwrap();
         let env = game.tale.env()
-            .expand(page.env(&mut game.formula, &env).unwrap())
+            .expand(mk_page_env(&page, &mut game.formula, &env).unwrap())
             .with_parent(&env);
         let condition = template
             .instantiate(
-                &&crate::formula::EvalValue::Object(IndexMap::new().into()),
+                &&EvalValue::Object(IndexMap::new().into()),
                 &mut game.formula,
                 &env,
             )
@@ -2355,15 +2335,15 @@ use super::{
         )
         .unwrap();
         assert_eq!(
-            character.story_tags.get("avant_id"),
+            character.story_tags.get(&EvalKey("avant_id".into())),
             Some(&EvalValue::String("brulure".into()))
         );
         assert_eq!(
-            character.story_tags.get("avant_formule"),
+            character.story_tags.get(&EvalKey("avant_formule".into())),
             Some(&EvalValue::String("brulure".into()))
         );
 
-        let cenv = character.base_env(&mut game.formula, &env).unwrap();
+        let cenv = mk_character_base_env(&character, &mut game.formula, &env).unwrap();
         let env = env.expand(cenv);
         let cells = eval_cells(&page.cells, &mut game.formula, &env).unwrap();
         game.apply_cells(
@@ -2385,10 +2365,10 @@ use super::{
         )
         .unwrap();
         assert_eq!(
-            character.story_tags.get("apres_intensite"),
+            character.story_tags.get(&EvalKey("apres_intensite".into())),
             Some(&EvalValue::Int(2))
         );
-        let cenv = character.base_env(&mut game.formula, &env).unwrap();
+        let cenv = mk_character_base_env(&character, &mut game.formula, &env).unwrap();
         let env = env.expand(cenv);
         let (_title, rendered) = progress
             .build(&game.terminal, &mut game.formula, &env)

@@ -7,10 +7,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use base64::Engine;
 use serde_json::{Map, Value};
+use formulas::{full_formula, has_formula_substitution, validate_formula_syntax};
 
 use crate::{
     document::single_id_filter,
-    formula::{full_formula, has_formula_substitution, validate_formula_syntax},
     graph,
     images::SUPPORTED_FORMATS,
     json_util::required_value,

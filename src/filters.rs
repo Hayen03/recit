@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use crate::character::Character;
 use crate::effects::Deferred;
-use crate::formula::{
-    Env, EvalValue, FormulaConditionView, FormulaEngine, FormulaItemView, split_fmt_str, value_or_formula
+use crate::formula::{json_to_eval_value, mk_character_env, mk_new_condition_env, mk_new_item_env};
+use formulas::{
+    Env, EvalKey, EvalValue, FormulaEngine, split_fmt_str, value_or_formula
 };
 use crate::json_util::{object, required_string, string_list, value_or};
 use crate::model::{ConditionInstance, ItemStack, collect_traits, eval_traits};
@@ -113,56 +114,52 @@ impl Conditional {
             )?),
             "attribut_egal" => Self::AttributeEq {
                 attribute: required_string(data, "attribut", "ATTRIBUT_EGAL")?.into(),
-                value: value_or_formula(data
+                value: value_or_formula(json_to_eval_value(&data
                     .get("valeur")
                     .cloned()
-                    .ok_or_else(|| anyhow!("ATTRIBUT_EGAL doit inclure un champ `valeur`"))?
-                    .try_into()?)?,
+                    .ok_or_else(|| anyhow!("ATTRIBUT_EGAL doit inclure un champ `valeur`"))?)?)?,
             },
             "attribut_superieur" => Self::AttributeGreater {
                 attribute: required_string(data, "attribut", "ATTRIBUT_SUPERIEUR")?.into(),
-                value: value_or_formula(data
+                value: value_or_formula(json_to_eval_value(&data
                     .get("valeur")
                     .cloned()
-                    .ok_or_else(|| anyhow!("ATTRIBUT_SUPERIEUR doit inclure un champ `valeur`"))?
-                    .try_into()?)?,
+                    .ok_or_else(|| anyhow!("ATTRIBUT_SUPERIEUR doit inclure un champ `valeur`"))?)?)?,
             },
             "attribut_inferieur" => Self::AttributeLess {
                 attribute: required_string(data, "attribut", "ATTRIBUT_INFERIEUR")?.into(),
-                value: value_or_formula(data
+                value: value_or_formula(json_to_eval_value(&data
                     .get("valeur")
                     .cloned()
-                    .ok_or_else(|| anyhow!("ATTRIBUT_INFERIEUR doit inclure un champ `valeur`"))?
-                    .try_into()?)?,
+                    .ok_or_else(|| anyhow!("ATTRIBUT_INFERIEUR doit inclure un champ `valeur`"))?)?)?,
             },
             "formule" => Self::Formula(
-                value_or_formula(data
+                value_or_formula(json_to_eval_value(&data
                     .get("formule")
                     .cloned()
-                    .ok_or_else(|| anyhow!("FORMULE doit inclure une formule"))?
-                    .try_into()?)?,
+                    .ok_or_else(|| anyhow!("FORMULE doit inclure une formule"))?)?)?,
             ),
-            "pv_egaux" => Self::HpEq(value_or_formula(required_value(data, "valeur", "PV_EGAUX")?.try_into()?)?),
+            "pv_egaux" => Self::HpEq(value_or_formula(json_to_eval_value(&required_value(data, "valeur", "PV_EGAUX")?)?)?),
             "pv_superieurs" => {
-                Self::HpGreater(value_or_formula(required_value(data, "valeur", "PV_SUPERIEURS")?.try_into()?)?)
+                Self::HpGreater(value_or_formula(json_to_eval_value(&required_value(data, "valeur", "PV_SUPERIEURS")?)?)?)
             }
             "pv_inferieurs" => {
-                Self::HpLess(value_or_formula(required_value(data, "valeur", "PV_INFERIEURS")?.try_into()?)?)
+                Self::HpLess(value_or_formula(json_to_eval_value(&required_value(data, "valeur", "PV_INFERIEURS")?)?)?)
             }
             "moral_egal" => {
-                Self::MoraleEq(value_or_formula(required_value(data, "valeur", "MORAL_EGAL")?.try_into()?)?)
+                Self::MoraleEq(value_or_formula(json_to_eval_value(&required_value(data, "valeur", "MORAL_EGAL")?)?)?)
             }
             "moral_superieur" => {
-                Self::MoraleGreater(value_or_formula(required_value(data, "valeur", "MORAL_SUPERIEUR")?.try_into()?)?)
+                Self::MoraleGreater(value_or_formula(json_to_eval_value(&required_value(data, "valeur", "MORAL_SUPERIEUR")?)?)?)
             }
             "moral_inferieur" => {
-                Self::MoraleLess(value_or_formula(required_value(data, "valeur", "MORAL_INFERIEUR")?.try_into()?)?)
+                Self::MoraleLess(value_or_formula(json_to_eval_value(&required_value(data, "valeur", "MORAL_INFERIEUR")?)?)?)
             }
             "etat_requis" => Self::RequireCondition(ConditionFilter::from_json(
                 data.get("filtre")
                     .ok_or_else(|| anyhow!("ETAT_REQUIS doit inclure un filtre"))?,
             )?),
-            "aleatoire" => Self::Random(value_or_formula(required_value(data, "poids", "ALEATOIRE")?.try_into()?)?),
+            "aleatoire" => Self::Random(value_or_formula(json_to_eval_value(&required_value(data, "poids", "ALEATOIRE")?)?)?),
             "tag_page" => Self::PageTag(TagFilter::from_json(
                 data.get("filtre")
                     .ok_or_else(|| anyhow!("TAG_PAGE doit inclure un filtre"))?,
@@ -188,7 +185,7 @@ impl Conditional {
             _ => bail!("Une condition doit être un tableau ou un objet"),
         };
         let kind = if let EvalValue::String(s) = data
-            .get("type")
+            .get(&EvalKey::from("type"))
             .ok_or_else(|| anyhow!("Une condition doit inclure un champ `type`"))? {
             s.clone()
         } else {
@@ -196,7 +193,7 @@ impl Conditional {
         };
         Ok(match kind.as_ref() {
             "et" => {
-                match data.get("conditions") {
+                match data.get(&EvalKey::from("conditions")) {
                     Some(EvalValue::Array(arr)) => {
                         Self::And(arr.iter().map(|item| Self::from_dict(item)).collect::<Result<Arc<_>>>()?)
                     },
@@ -208,7 +205,7 @@ impl Conditional {
                 }
             },
             "ou" => {
-                match data.get("conditions") {
+                match data.get(&EvalKey::from("conditions")) {
                     Some(EvalValue::Array(arr)) => {
                         Self::Or(arr.iter().map(|item| Self::from_dict(item)).collect::<Result<Arc<_>>>()?)
                     },
@@ -220,74 +217,74 @@ impl Conditional {
                 }
             },
             "non" => {
-                if let Some(condition) = data.get("condition") {
+                if let Some(condition) = data.get(&EvalKey::from("condition")) {
                     Self::Not(Arc::new(Self::from_dict(condition)?))
                 } else {
                     bail!("Une condition NON doit inclure une sous-condition")
                 }
             },
             "objet_requis" => {
-                Self::RequireItem(ItemFilter::from_dict(data.get("filtre").ok_or_else(|| anyhow!("OBJET_REQUIS doit inclure un filtre"))?)?)
+                Self::RequireItem(ItemFilter::from_dict(data.get(&EvalKey::from("filtre")).ok_or_else(|| anyhow!("OBJET_REQUIS doit inclure un filtre"))?)?)
             },
             "tag_requis" => {
-                Self::RequireTag(TagFilter::from_dict(data.get("filtre").ok_or_else(|| anyhow!("TAG_REQUIS doit inclure un filtre"))?)?)
+                Self::RequireTag(TagFilter::from_dict(data.get(&EvalKey::from("filtre")).ok_or_else(|| anyhow!("TAG_REQUIS doit inclure un filtre"))?)?)
             },
             "attribut_egal" => {
-                let attribut = match data.get("attribut") {
+                let attribut = match data.get(&EvalKey::from("attribut")) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("ATTRIBUT_EGAL doit inclure un champ `attribut`"),
                 };
                 Self::AttributeEq {
                     attribute: attribut,
-                    value: data.get("valeur").cloned().ok_or_else(|| anyhow!("ATTRIBUT_EGAL doit inclure un champ `valeur`"))?,
+                    value: data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("ATTRIBUT_EGAL doit inclure un champ `valeur`"))?,
                 }
             },
             "attribut_superieur" => {
-                let attribut = match data.get("attribut") {
+                let attribut = match data.get(&EvalKey::from("attribut")) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("ATTRIBUT_SUPERIEUR doit inclure un champ `attribut`"),
                 };
                 Self::AttributeGreater {
                     attribute: attribut,
-                    value: data.get("valeur").cloned().ok_or_else(|| anyhow!("ATTRIBUT_SUPERIEUR doit inclure un champ `valeur`"))?,
+                    value: data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("ATTRIBUT_SUPERIEUR doit inclure un champ `valeur`"))?,
                 }
             },
             "attribut_inferieur" => {
-                let attribut = match data.get("attribut") {
+                let attribut = match data.get(&EvalKey::from("attribut")) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("ATTRIBUT_INFERIEUR doit inclure un champ `attribut`"),
                 };
                 Self::AttributeLess {
                     attribute: attribut,
-                    value: data.get("valeur").cloned().ok_or_else(|| anyhow!("ATTRIBUT_INFERIEUR doit inclure un champ `valeur`"))?,
+                    value: data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("ATTRIBUT_INFERIEUR doit inclure un champ `valeur`"))?,
                 }
             },
             "formule" => {
-                Self::Formula(data.get("formule").cloned().ok_or_else(|| anyhow!("FORMULE doit inclure une formule"))?)
+                Self::Formula(data.get(&EvalKey::from("formule")).cloned().ok_or_else(|| anyhow!("FORMULE doit inclure une formule"))?)
             },
             "pv_egaux" => {
-                Self::HpEq(data.get("valeur").cloned().ok_or_else(|| anyhow!("PV_EGAUX doit inclure un champ `valeur`"))?)
+                Self::HpEq(data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("PV_EGAUX doit inclure un champ `valeur`"))?)
             },
             "pv_superieurs" => {
-                Self::HpGreater(data.get("valeur").cloned().ok_or_else(|| anyhow!("PV_SUPERIEURS doit inclure un champ `valeur`"))?)
+                Self::HpGreater(data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("PV_SUPERIEURS doit inclure un champ `valeur`"))?)
             },
             "pv_inferieurs" => {
-                Self::HpLess(data.get("valeur").cloned().ok_or_else(|| anyhow!("PV_INFERIEURS doit inclure un champ `valeur`"))?)
+                Self::HpLess(data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("PV_INFERIEURS doit inclure un champ `valeur`"))?)
             },
             "moral_egal" => {
-                Self::MoraleEq(data.get("valeur").cloned().ok_or_else(|| anyhow!("MORAL_EGAL doit inclure un champ `valeur`"))?)
+                Self::MoraleEq(data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("MORAL_EGAL doit inclure un champ `valeur`"))?)
             },
             "moral_superieur" => {
-                Self::MoraleGreater(data.get("valeur").cloned().ok_or_else(|| anyhow!("MORAL_SUPERIEUR doit inclure un champ `valeur`"))?)
+                Self::MoraleGreater(data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("MORAL_SUPERIEUR doit inclure un champ `valeur`"))?)
             },
             "moral_inferieur" => {
-                Self::MoraleLess(data.get("valeur").cloned().ok_or_else(|| anyhow!("MORAL_INFERIEUR doit inclure un champ `valeur`"))?)
+                Self::MoraleLess(data.get(&EvalKey::from("valeur")).cloned().ok_or_else(|| anyhow!("MORAL_INFERIEUR doit inclure un champ `valeur`"))?)
             },
             "etat_requis" => {
-                Self::RequireCondition(ConditionFilter::from_dict(data.get("filtre").ok_or_else(|| anyhow!("ETAT_REQUIS doit inclure un filtre"))?)?)
+                Self::RequireCondition(ConditionFilter::from_dict(data.get(&EvalKey::from("filtre")).ok_or_else(|| anyhow!("ETAT_REQUIS doit inclure un filtre"))?)?)
             },
             "aleatoire" => {
-                let poids = match data.get("poids") {
+                let poids = match data.get(&EvalKey::from("poids")) {
                     Some(EvalValue::Int(i)) => EvalValue::Int(*i),
                     Some(EvalValue::Float(f)) => EvalValue::Float(*f),
                     Some(EvalValue::String(s)) => EvalValue::String(s.clone()),
@@ -296,10 +293,10 @@ impl Conditional {
                 Self::Random(poids)
             },
             "tag_page" => {
-                Self::PageTag(TagFilter::from_dict(data.get("filtre").ok_or_else(|| anyhow!("TAG_PAGE doit inclure un filtre"))?)?)
+                Self::PageTag(TagFilter::from_dict(data.get(&EvalKey::from("filtre")).ok_or_else(|| anyhow!("TAG_PAGE doit inclure un filtre"))?)?)
             },
             "tag_connexion" => {
-                Self::ConnectionTag(TagFilter::from_dict(data.get("filtre").ok_or_else(|| anyhow!("TAG_CONNEXION doit inclure un filtre"))?)?)
+                Self::ConnectionTag(TagFilter::from_dict(data.get(&EvalKey::from("filtre")).ok_or_else(|| anyhow!("TAG_CONNEXION doit inclure un filtre"))?)?)
             },
             _ => bail!("Type de condition non supporté: {kind}"),
         })
@@ -323,8 +320,8 @@ impl Conditional {
     pub fn matches(
         &self,
         character: &Character,
-        page_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
-        connection_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
+        page_tags: Arc<IndexMap<EvalKey, EvalValue>>,
+        connection_tags: Arc<IndexMap<EvalKey, EvalValue>>,
         tale: &crate::model::Tale,
         formula: &mut FormulaEngine,
         additional_env: &Env,
@@ -333,7 +330,8 @@ impl Conditional {
             match self {
             Self::And(values) => {
                 for value in values.iter() {
-                    if !value.matches(character, page_tags.clone(), connection_tags.clone(), tale, formula, additional_env)? {
+                    if !value.matches(character, page_tags.clone(), connection_tags.clone(), tale, formula, additional_env)
+                        .with_context(|| "Error evaluating AND condition")? {
                         return Ok(false);
                     }
                 }
@@ -341,7 +339,8 @@ impl Conditional {
             }
             Self::Or(values) => {
                 for value in values.iter() {
-                    if value.matches(character, page_tags.clone(), connection_tags.clone(), tale, formula, additional_env)? {
+                    if value.matches(character, page_tags.clone(), connection_tags.clone(), tale, formula, additional_env)
+                        .with_context(|| "Error evaluating OR condition")? {
                         return Ok(true);
                     }
                 }
@@ -354,11 +353,11 @@ impl Conditional {
                 tale,
                 formula,
                 additional_env,
-            )?),
+            ).with_context(|| "Error evaluating NOT condition")?),
             Self::RequireItem(filter) => {
                 let base_env = conditional_env(character, page_tags, formula, additional_env)?;
                 for stack in &character.inventory {
-                    if filter.matches(stack, formula, &base_env)? {
+                    if filter.matches(stack, formula, &base_env).with_context(|| "Error evaluating REQUIRE_ITEM condition")? {
                         return Ok(true);
                     }
                 }
@@ -367,7 +366,10 @@ impl Conditional {
             Self::RequireTag(filter) => {
                 let base_env = conditional_env(character, page_tags, formula, additional_env)?;
                 for (tag, value) in character.story_tags.iter() {
-                    if filter.matches(tag, value, character, formula, &base_env)? {
+                    let EvalKey(EvalValue::String(tag)) = tag else {
+                        bail!("Error evaluating REQUIRE_TAG condition: tag is not a string");
+                    };
+                    if filter.matches(tag, value, character, formula, &base_env).with_context(|| "Error evaluating REQUIRE_TAG condition")? {
                         return Ok(true);
                     }
                 }
@@ -375,43 +377,53 @@ impl Conditional {
             }
             Self::AttributeEq { attribute, value } => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.actual_attribute(attribute, formula, additional_env)? == formula.resolve_formula_int(value, &env)?)
+                Ok(character.actual_attribute(attribute, formula, additional_env)? == formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition ATTRIBUT_EGAL"))?)
             }
             Self::AttributeGreater { attribute, value } => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.actual_attribute(attribute, formula, additional_env)? > formula.resolve_formula_int(value, &env)?)
+                Ok(character.actual_attribute(attribute, formula, additional_env)? > formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition ATTRIBUT_SUPERIEUR"))?)
             }
             Self::AttributeLess { attribute, value } => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.actual_attribute(attribute, formula, additional_env)? < formula.resolve_formula_int(value, &env)?)
+                Ok(character.actual_attribute(attribute, formula, additional_env)? < formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition ATTRIBUT_INFERIEUR"))?)
             }
             Self::Formula(value) => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
                 formula.resolve_formula_bool(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition FORMULE"))
             }
             Self::HpEq(value) => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.hp == formula.resolve_formula_int(value, &env)?)
+                Ok(character.hp == formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition PV_EGAL"))?)
             }
             Self::HpGreater(value) => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.hp > formula.resolve_formula_int(value, &env)?)
+                Ok(character.hp > formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition PV_SUPERIEUR"))?)
             }
             Self::HpLess(value) => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.hp < formula.resolve_formula_int(value, &env)?)
+                Ok(character.hp < formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition PV_INFERIEUR"))?)
             }
             Self::MoraleEq(value) => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.morale == formula.resolve_formula_int(value, &env)?)
+                Ok(character.morale == formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition MORALE_EGAL"))?)
             }
             Self::MoraleGreater(value) => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.morale > formula.resolve_formula_int(value, &env)?)
+                Ok(character.morale > formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition MORALE_SUPERIEUR"))?)
             }
             Self::MoraleLess(value) => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                Ok(character.morale < formula.resolve_formula_int(value, &env)?)
+                Ok(character.morale < formula.resolve_formula_int(value, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition MORALE_INFERIEUR"))?)
             }
             Self::RequireCondition(filter) => {
                 let base_env = conditional_env(character, page_tags, formula, additional_env)?;
@@ -424,12 +436,16 @@ impl Conditional {
             }
             Self::Random(weight) => {
                 let env = conditional_env(character, page_tags, formula, additional_env)?;
-                let weight = formula.resolve_formula_int(weight, &env)?;
+                let weight = formula.resolve_formula_int(weight, &env)
+                    .map_err(|_err| anyhow!("Erreur en évaluant la condition ALEATOIRE"))?;
                 Ok(formula.random_percent() < weight as f64)
             }
             Self::PageTag(filter) => {
                 let env = conditional_env(character, page_tags.clone(), formula, additional_env)?;
                 for (tag, value) in page_tags.iter() {
+                    let EvalKey(EvalValue::String(tag)) = tag else {
+                        bail!("Le tag de page doit être une chaîne de caractères");
+                    };
                     if filter.matches(tag, value, character, formula, &env)? {
                         return Ok(true);
                     }
@@ -439,6 +455,9 @@ impl Conditional {
             Self::ConnectionTag(filter) => {
                 let env = conditional_env(character, page_tags.clone(), formula, additional_env)?;
                 for (tag, value) in connection_tags.iter() {
+                    let EvalKey(EvalValue::String(tag)) = tag else {
+                        bail!("Le tag de connexion doit être une chaîne de caractères");
+                    };
                     if filter.matches(tag, value, character, formula, &env)? {
                         return Ok(true);
                     }
@@ -457,11 +476,11 @@ impl Conditional {
 /// mutating the source character, page, item, or state.
 fn conditional_env<'a>(
     character: &Character,
-    page_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
+    page_tags: Arc<IndexMap<EvalKey, EvalValue>>,
     formula: &mut FormulaEngine,
     additional_env: &'a Env<'a>,
 ) -> Result<Env<'a>> {
-    let mut env = character.env(formula, additional_env)?;
+    let mut env = mk_character_env(character, formula, additional_env)?;
     env.insert("page", EvalValue::Object(page_tags.clone()));
     Ok(env.with_parent(additional_env))
 }
@@ -492,18 +511,20 @@ fn required_value(
         .ok_or_else(|| anyhow!("{context} doit inclure un champ `{key}`"))
 }
 
-fn follow_map_path<'a>(data: &'a IndexMap<Arc<str>, EvalValue>, path: &[&str]) -> Option<&'a EvalValue> {
+fn follow_map_path<'a>(data: &'a IndexMap<EvalKey, EvalValue>, path: &[&str]) -> Option<&'a EvalValue> {
     let mut current: Option<&EvalValue> = None;
     for key in path {
         match (current, key.parse::<usize>().ok()) {
             (None, None) => {
-                current = data.get(*key);
+                let key: EvalKey = (*key).into();
+                current = data.get(&key);
                 if current == None {
                     return None;
                 }
             },
             (Some(EvalValue::Object(obj)), None) => {
-                current = obj.get(*key);
+                let key: EvalKey = (*key).into();
+                current = obj.get(&key);
                 if current == None {
                     return None;
                 }
@@ -568,17 +589,17 @@ impl ConditionFilter {
             )?)),
             "donnee_egale" | "egale" => Self::DataEq {
                 key: required_string(data, "cle", "DONNEE_EGALE")?.into(),
-                value: value_or_formula(value_or(data, "valeur", JsonValue::Null).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::Null))?)?,
             },
             "donnee_superieure" | "superieure" => Self::DataGreater {
                 key: required_string(data, "cle", "DONNEE_SUPERIEURE")?.into(),
-                value: value_or_formula(value_or(data, "valeur", JsonValue::Null).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::Null))?)?,
             },
             "donnee_inferieure" | "inferieure" => Self::DataLess {
                 key: required_string(data, "cle", "DONNEE_INFERIEURE")?.into(),
-                value: value_or_formula(value_or(data, "valeur", JsonValue::Null).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::Null))?)?,
             },
-            "formule" => Self::Formula(value_or_formula(required_value(data, "formule", "FORMULE")?.try_into()?)?),
+            "formule" => Self::Formula(value_or_formula(json_to_eval_value(&required_value(data, "formule", "FORMULE")?)?)?),
             "tous_les_traits" | "tous" => Self::TraitAll(collect_traits(data.get("traits"))
                 .with_context(|| "Parsing des traits pour filtre 'tous_les_traits'")?),
             "un_des_traits" | "un" => Self::TraitAny(collect_traits(data.get("traits"))
@@ -609,7 +630,7 @@ impl ConditionFilter {
             _ => bail!("Un filtre d'état doit être un tableau ou un objet"),
         };
         let kind = if let EvalValue::String(s) = data
-            .get("type")
+            .get(&EvalKey("type".into()))
             .ok_or_else(|| anyhow!("Un filtre d'état doit inclure un champ `type`"))? {
             s.clone()
         } else {
@@ -617,7 +638,7 @@ impl ConditionFilter {
         };
         Ok(match kind.as_ref() {
             "et" => {
-                match data.get("filtres") {
+                match data.get(&EvalKey("filtres".into())) {
                     Some(EvalValue::Array(arr)) => {
                         Self::And(arr.iter().map(|item| Self::from_dict(item)).collect::<Result<Arc<_>>>()?)
                     },
@@ -629,7 +650,7 @@ impl ConditionFilter {
                 }
             },
             "ou" => {
-                match data.get("filtres") {
+                match data.get(&EvalKey("filtres".into())) {
                     Some(EvalValue::Array(arr)) => {
                         Self::Or(arr.iter().map(|item| Self::from_dict(item)).collect::<Result<Arc<_>>>()?)
                     },
@@ -641,36 +662,36 @@ impl ConditionFilter {
                 }
             },
             "non" => {
-                if let Some(filter) = data.get("filtre") {
+                if let Some(filter) = data.get(&EvalKey("filtre".into())) {
                     Self::Not(Arc::new(Self::from_dict(filter)?))
                 } else {
                     bail!("Un filtre d'état NON doit inclure un sous-filtre")
                 }
             },
             "donnee_egale" | "egale" => Self::DataEq {
-                key: match data.get("cle") {
+                key: match data.get(&EvalKey("cle".into())) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("DONNEE_EGALE doit inclure un champ `cle`"),
                 },
-                value: data.get("valeur").cloned().ok_or_else(|| anyhow!("DONNEE_EGALE doit inclure un champ `valeur`"))?,
+                value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("DONNEE_EGALE doit inclure un champ `valeur`"))?,
             },
             "donnee_superieure" | "superieure" => Self::DataGreater {
-                key: match data.get("cle") {
+                key: match data.get(&EvalKey("cle".into())) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("DONNEE_SUPERIEURE doit inclure un champ `cle`"),
                 },
-                value: data.get("valeur").cloned().ok_or_else(|| anyhow!("DONNEE_SUPERIEURE doit inclure un champ `valeur`"))?,
+                value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("DONNEE_SUPERIEURE doit inclure un champ `valeur`"))?,
             },
             "donnee_inferieure" | "inferieure" => Self::DataLess {
-                key: match data.get("cle") {
+                key: match data.get(&EvalKey("cle".into())) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("DONNEE_INFERIEURE doit inclure un champ `cle`"),
                 },
-                value: data.get("valeur").cloned().ok_or_else(|| anyhow!("DONNEE_INFERIEURE doit inclure un champ `valeur`"))?,
+                value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("DONNEE_INFERIEURE doit inclure un champ `valeur`"))?,
             },
-            "formule" => Self::Formula(data.get("formule").cloned().ok_or_else(|| anyhow!("FORMULE doit inclure un champ `formule`"))?),
+            "formule" => Self::Formula(data.get(&EvalKey("formule".into())).cloned().ok_or_else(|| anyhow!("FORMULE doit inclure un champ `formule`"))?),
             "tous_les_traits" | "tous" => {
-                let traits = match data.get("traits") {
+                let traits = match data.get(&EvalKey("traits".into())) {
                     Some(EvalValue::Array(arr)) => {
                         arr
                             .iter()
@@ -688,7 +709,7 @@ impl ConditionFilter {
                 Self::TraitAll(traits)
             },
             "un_des_traits" | "un" => {
-                let traits = match data.get("traits") {
+                let traits = match data.get(&EvalKey("traits".into())) {
                     Some(EvalValue::Array(arr)) => {
                         arr
                             .iter()
@@ -706,7 +727,7 @@ impl ConditionFilter {
                 Self::TraitAny(traits)
             },
             "id" => {
-                let id = match data.get("id") {
+                let id = match data.get(&EvalKey("id".into())) {
                     Some(EvalValue::String(s)) => EvalValue::String(s.clone()),
                     Some(EvalValue::Func(f)) => EvalValue::Func(f.clone()),
                     _ => bail!("Filtre ID doit inclure un champ `id`"),
@@ -741,7 +762,7 @@ impl ConditionFilter {
             Self::Or(filters) => any_condition_filters(filters, condition, formula, &env),
             Self::Not(filter) => Ok(!filter.matches(condition, formula, env)?),
             Self::DataEq { key, value } => {
-                let env = condition.env(formula, env)
+                let env = mk_new_condition_env(condition, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'etat pour un filtre de donnée égale")?
                     .with_parent(env);
                 let expected = formula.resolve_formula(value, &env)?;
@@ -750,7 +771,7 @@ impl ConditionFilter {
                     .is_some_and(|actual| actual == &expected))
             }
             Self::DataGreater { key, value } => {
-                let env = condition.env(formula, env)
+                let env = mk_new_condition_env(condition, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'etat pour un filtre de donnée supérieur")?
                     .with_parent(env);
                 let expected = match formula.resolve_formula_float(value, &env) {
@@ -762,7 +783,7 @@ impl ConditionFilter {
                     .is_some_and(|actual| actual > &expected))
             }
             Self::DataLess { key, value } => {
-                let env = condition.env(formula, env)
+                let env = mk_new_condition_env(condition, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'etat pour un filtre de donnée inférieur")?
                     .with_parent(env);
                 let expected = match formula.resolve_formula_float(value, &env) {
@@ -774,19 +795,19 @@ impl ConditionFilter {
                     .is_some_and(|actual| actual < &expected))
             }
             Self::Formula(value) => {
-                let env = condition.env(formula, env)
+                let env = mk_new_condition_env(condition, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'etat pour un filtre de formule")?
                     .with_parent(env);
-                formula.resolve_formula_bool(value, &env)
+                formula.resolve_formula_bool(value, &env).map_err(|err| anyhow!("Erreur en évaluant la formule: {}", err))
             },
             Self::TraitAll(traits) => {
-                let condition_env = condition.env(formula, env)?;
+                let condition_env = mk_new_condition_env(condition, formula, env)?;
                 // extract the traits
                 let condition_traits = condition_env
                     .get("etat")
                     .map(|obj| {
                         if let EvalValue::Object(obj_map) = obj {
-                            obj_map.get("traits").cloned()
+                            obj_map.get(&EvalKey("traits".into())).cloned()
                         } else {
                             None
                         }
@@ -799,13 +820,13 @@ impl ConditionFilter {
                 Ok(target_traits.iter().all(|trait_name| condtion_traits.contains(trait_name)))
             },
             Self::TraitAny(traits) => {
-                let condition_env = condition.env(formula, env)?;
+                let condition_env = mk_new_condition_env(condition, formula, env)?;
                 // extract the traits
                 let condition_traits = condition_env
                     .get("etat")
                     .map(|obj| {
                         if let EvalValue::Object(obj_map) = obj {
-                            obj_map.get("traits").cloned()
+                            obj_map.get(&EvalKey("traits".into())).cloned()
                         } else {
                             None
                         }
@@ -818,7 +839,7 @@ impl ConditionFilter {
                 Ok(target_traits.iter().any(|trait_name| condtion_traits.contains(trait_name)))
             },
             Self::Id(id) => {
-                let env = condition.env(formula, env)
+                let env = mk_new_condition_env(condition, formula, env)
                     .with_context(|| "Erreur en créant l'environement d'état pour un filtre id")?
                     .with_parent(env);
                 Ok(condition.template.id == formula.fmt_value(id, &env)?)
@@ -826,109 +847,6 @@ impl ConditionFilter {
         }
     }
 
-    /// Returns whether a formula-facing state snapshot satisfies this tale filter.
-    ///
-    /// Formula predicates use the supplied runtime bindings. Evaluation errors propagate
-    /// instead of being converted to a false result.
-    ///
-    /// # Arguments
-    ///
-    /// - `formula` — Formula engine used for evaluation and deterministic randomness.
-    /// - `env` — Additional formula bindings for the current lifecycle operation.
-    ///
-    /// # Errors
-    ///
-    /// Propagates formula-evaluation and nested-filter errors.
-    pub fn matches_view(
-        &self,
-        condition: &FormulaConditionView,
-        formula: &mut FormulaEngine,
-        env: &Env,
-    ) -> Result<bool> {
-        match self {
-            Self::And(filters) => {
-                for filter in filters.iter() {
-                    if !filter.matches_view(condition, formula, env)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Self::Or(filters) => {
-                for filter in filters.iter() {
-                    if filter.matches_view(condition, formula, env)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            Self::Not(filter) => Ok(!filter.matches_view(condition, formula, env)?),
-            Self::DataEq { key, value } => {
-                let expected = formula.resolve_formula(value, &env.merged(&condition.env()))?;
-                Ok(condition
-                    .data
-                    .get(key)
-                    .is_some_and(|actual| actual == &expected))
-            }
-            Self::DataGreater { key, value } => {
-                let expected = match formula.resolve_formula_float(value, &env.merged(&condition.env())) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(false),
-                };
-                Ok(condition
-                    .data
-                    .get(key)
-                    .is_some_and(|actual| actual > &expected))
-            }
-            Self::DataLess { key, value } => {
-                let expected = match formula.resolve_formula_float(value, &env.merged(&condition.env())) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(false),
-                };
-                Ok(condition
-                    .data
-                    .get(key)
-                    .is_some_and(|actual| actual < &expected))
-            }
-            Self::Formula(value) => formula.resolve_formula_bool(value, &env.merged(&condition.env())),
-            Self::Id(id) => {
-                let env = condition.env().with_parent(env);
-                Ok(condition.id == formula.fmt_value(id, &env)?)
-            },
-            Self::TraitAll(traits) => {
-                let cond_env = condition.env().with_parent(env);
-                let targets = eval_traits(traits, formula, &cond_env)
-                    .with_context(|| "Erreur lors de l'évaluation des traits d'un filtre d'état 'tous les traits'")?;
-                let res = targets.iter().try_fold(true, |matched, trait_name| {
-                    let EvalValue::String(trait_name) = trait_name else {
-                        bail!(
-                            "Trait évalué d'un filtre d'état 'tous les traits' \
-                            n'est pas une chaîne : {trait_name:?}"
-                        );
-                    };
-
-                    Ok(matched && condition.traits.contains(trait_name))
-                })?;
-                Ok(res)
-            },
-            Self::TraitAny(traits) => {
-                let cond_env = condition.env().with_parent(env);
-                let targets = eval_traits(traits, formula, &cond_env)
-                    .with_context(|| "Erreur lors de l'évaluation des traits d'un filtre d'état 'au moins un des traits'")?;
-                let res = targets.iter().try_fold(false, |matched, trait_name| {
-                    let EvalValue::String(trait_name) = trait_name else {
-                        bail!(
-                            "Trait évalué d'un filtre d'état 'au moins un des traits' \
-                            n'est pas une chaîne : {trait_name:?}"
-                        );
-                    };
-
-                    Ok(matched || condition.traits.contains(trait_name))
-                })?;
-                Ok(res)
-            },
-        }
-    }
 }
 
 /// Returns whether every state filter in a list matches the instance.
@@ -1005,7 +923,7 @@ impl CheckFilter {
             )?),
             "tous_les_traits" | "tous" => Self::TraitAll(parse_traits(data.get("traits"), true)?),
             "un_des_traits" | "un" => Self::TraitAny(parse_traits(data.get("traits"), true)?),
-            "formule" => Self::Formula(value_or_formula(required_value(data, "formule", "FORMULE")?.try_into()?)?),
+            "formule" => Self::Formula(value_or_formula(json_to_eval_value(&required_value(data, "formule", "FORMULE")?)?)?),
             _ => bail!("Type de filtre de test non supporté: {kind}"),
         })
     }
@@ -1065,7 +983,7 @@ impl CheckFilter {
                     "traits",
                     EvalValue::Array(traits.iter().cloned().map(EvalValue::String).collect()),
                 );
-                formula.resolve_formula_bool(value, &env)
+                formula.resolve_formula_bool(value, &env).map_err(|err| anyhow!("Erreur en évaluant une formule: {}", err))
             }
         }
     }
@@ -1121,30 +1039,30 @@ impl ItemFilter {
             "id" => Self::Id(split_fmt_str(&required_string(data, "id", "Filtre ID")?)?),
             "donnee_egale" => Self::DataEq {
                 key: required_string(data, "cle", "DONNEE_EGALE")?.into(),
-                value: value_or_formula(value_or(data, "valeur", JsonValue::Null).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::Null))?)?,
             },
             "donnee_superieure" => Self::DataGreater {
                 key: required_string(data, "cle", "DONNEE_SUPERIEURE")?.into(),
-                value: value_or_formula(value_or(data, "valeur", JsonValue::Null).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::Null))?)?,
             },
             "donnee_inferieure" => Self::DataLess {
                 key: required_string(data, "cle", "DONNEE_INFERIEURE")?.into(),
-                value: value_or_formula(value_or(data, "valeur", JsonValue::Null).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::Null))?)?,
             },
             "quantite_egale" => {
-                Self::QuantityEq(value_or_formula(required_value(data, "quantite", "QUANTITE_EGALE")?.try_into()?)?)
+                Self::QuantityEq(value_or_formula(json_to_eval_value(&required_value(data, "quantite", "QUANTITE_EGALE")?)?)?)
             }
             "quantite_superieure" => Self::QuantityGreater(
-                value_or_formula(required_value(data, "quantite", "QUANTITE_SUPERIEURE")?.try_into()?)?,
+                value_or_formula(json_to_eval_value(&required_value(data, "quantite", "QUANTITE_SUPERIEURE")?)?)?,
             ),
             "quantite_inferieure" => Self::QuantityLess(
-                value_or_formula(required_value(data, "quantite", "QUANTITE_INFERIEURE")?.try_into()?)?,
+                value_or_formula(json_to_eval_value(&required_value(data, "quantite", "QUANTITE_INFERIEURE")?)?)?,
             ),
             "tous_les_traits" | "tous" => Self::TraitAll(collect_traits(data.get("traits"))
                 .with_context(|| "Parsing des traits pour filtre 'tous_les_traits'")?),
             "un_des_traits" | "un" => Self::TraitAny(collect_traits(data.get("traits"))
                 .with_context(|| "Parsing des traits pour filtre 'un_des_traits'")?),
-            "formule" => Self::Formula(value_or_formula(required_value(data, "formule", "FORMULE")?.try_into()?)?),
+            "formule" => Self::Formula(value_or_formula(json_to_eval_value(&required_value(data, "formule", "FORMULE")?)?)?),
             _ => bail!("Type de filtre d'objet non supporté: {kind}"),
         })
     }
@@ -1170,7 +1088,7 @@ impl ItemFilter {
             _ => bail!("Un filtre d'objet doit être un tableau ou un objet"),
         };
         let kind = if let EvalValue::String(s) = data
-            .get("type")
+            .get(&EvalKey("type".into()))
             .ok_or_else(|| anyhow!("Un filtre d'objet doit inclure un champ `type`"))? {
             s.clone()
         } else {
@@ -1178,7 +1096,7 @@ impl ItemFilter {
         };
         Ok(match kind.as_ref() {
             "et" => {
-                match data.get("filtres") {
+                match data.get(&EvalKey("filtres".into())) {
                     Some(EvalValue::Array(arr)) => {
                         Self::And(arr.iter().map(|item| Self::from_dict(item)).collect::<Result<Arc<_>>>()?)
                     },
@@ -1190,7 +1108,7 @@ impl ItemFilter {
                 }
             },
             "ou" => {
-                match data.get("filtres") {
+                match data.get(&EvalKey("filtres".into())) {
                     Some(EvalValue::Array(arr)) => {
                         Self::Or(arr.iter().map(|item| Self::from_dict(item)).collect::<Result<Arc<_>>>()?)
                     },
@@ -1202,14 +1120,14 @@ impl ItemFilter {
                 }
             },
             "non" => {
-                if let Some(filter) = data.get("filtre") {
+                if let Some(filter) = data.get(&EvalKey("filtre".into())) {
                     Self::Not(Arc::new(Self::from_dict(filter)?))
                 } else {
                     bail!("Un filtre d'objet NON doit inclure un sous-filtre")
                 }
             },
             "id" => {
-                let id = match data.get("id") {
+                let id = match data.get(&EvalKey("id".into())) {
                     Some(EvalValue::String(s)) => EvalValue::String(s.clone()),
                     Some(EvalValue::Func(f)) => EvalValue::Func(f.clone()),
                     _ => bail!("Filtre ID doit inclure un champ `id`"),
@@ -1217,49 +1135,49 @@ impl ItemFilter {
                 Self::Id(id)
             },
             "donnee_egale" => Self::DataEq {
-                key: match data.get("cle") {
+                key: match data.get(&EvalKey("cle".into())) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("DONNEE_EGALE doit inclure un champ `cle`"),
                 },
-                value: data.get("valeur").cloned().ok_or_else(|| anyhow!("DONNEE_EGALE doit inclure un champ `valeur`"))?,
+                value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("DONNEE_EGALE doit inclure un champ `valeur`"))?,
             },
             "donnee_superieure" => Self::DataGreater {
-                key: match data.get("cle") {
+                key: match data.get(&EvalKey("cle".into())) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("DONNEE_SUPERIEURE doit inclure un champ `cle`"),
                 },
-                value: data.get("valeur").cloned().ok_or_else(|| anyhow!("DONNEE_SUPERIEURE doit inclure un champ `valeur`"))?,
+                value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("DONNEE_SUPERIEURE doit inclure un champ `valeur`"))?,
             },
             "donnee_inferieure" => Self::DataLess {
-                key: match data.get("cle") {
+                key: match data.get(&EvalKey("cle".into())) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("DONNEE_INFERIEURE doit inclure un champ `cle`"),
                 },
-                value: data.get("valeur").cloned().ok_or_else(|| anyhow!("DONNEE_INFERIEURE doit inclure un champ `valeur`"))?,
+                value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("DONNEE_INFERIEURE doit inclure un champ `valeur`"))?,
             },
             "quantite_egale" => {
-                let quantity = match data.get("quantite") {
+                let quantity = match data.get(&EvalKey("quantite".into())) {
                     Some(value) => value.clone(),
                     None => bail!("QUANTITE_EGALE doit inclure un champ `quantite`"),
                 };
                 Self::QuantityEq(quantity)
             }
             "quantite_superieure" => {
-                let quantity = match data.get("quantite") {
+                let quantity = match data.get(&EvalKey("quantite".into())) {
                     Some(value) => value.clone(),
                     None => bail!("QUANTITE_SUPERIEURE doit inclure un champ `quantite`"),
                 };
                 Self::QuantityGreater(quantity)
             }
             "quantite_inferieure" => {
-                let quantity = match data.get("quantite") {
+                let quantity = match data.get(&EvalKey("quantite".into())) {
                     Some(value) => value.clone(),
                     None => bail!("QUANTITE_INFERIEURE doit inclure un champ `quantite`"),
                 };
                 Self::QuantityLess(quantity)
             }
             "tous_les_traits" | "tous" => {
-                let traits = match data.get("traits") {
+                let traits = match data.get(&EvalKey("traits".into())) {
                     Some(EvalValue::Array(arr)) => {
                         arr
                             .iter()
@@ -1277,7 +1195,7 @@ impl ItemFilter {
                 Self::TraitAll(traits)
             },
             "un_des_traits" | "un" => {
-                let traits = match data.get("traits") {
+                let traits = match data.get(&EvalKey("traits".into())) {
                     Some(EvalValue::Array(arr)) => {
                         arr
                             .iter()
@@ -1295,7 +1213,7 @@ impl ItemFilter {
                 Self::TraitAny(traits)
             },
             "formule" => {
-                let formula = match data.get("formule") {
+                let formula = match data.get(&EvalKey("formule".into())) {
                     Some(value) => value.clone(),
                     None => bail!("FORMULE doit inclure un champ `formule`"),
                 };
@@ -1343,13 +1261,13 @@ impl ItemFilter {
             }
             Self::Not(filter) => Ok(!filter.matches(stack, formula, env)?),
             Self::Id(id) => {
-                let env = stack.env(formula, env)
+                let env = mk_new_item_env(stack, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre id")?
                     .with_parent(env);
                 Ok(stack.item.id == formula.fmt_value(id, &env)?)
             },
             Self::DataEq { key, value } => {
-                let env = stack.env(formula, env)
+                let env = mk_new_item_env(stack, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de donnée égale")?
                     .with_parent(env);
                 let expected = formula.resolve_formula(value, &env)?;
@@ -1358,7 +1276,7 @@ impl ItemFilter {
                     .is_some_and(|actual| actual == &expected))
             }
             Self::DataGreater { key, value } => {
-                let env = stack.env(formula, env)
+                let env = mk_new_item_env(stack, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de donnée supérieure")?
                     .with_parent(env);
                 let expected = formula.resolve_formula_float(value, &env)?;
@@ -1367,7 +1285,7 @@ impl ItemFilter {
                     .is_some_and(|actual| actual > &expected))
             }
             Self::DataLess { key, value } => {
-                let env = stack.env(formula, env)
+                let env = mk_new_item_env(stack, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de donnée inférieure")?
                     .with_parent(env);
                 let expected = formula.resolve_formula_float(value, &env)?;
@@ -1376,31 +1294,32 @@ impl ItemFilter {
                     .is_some_and(|actual| actual < &expected))
             }
             Self::QuantityEq(value) => {
-                let env = stack.env(formula, env)
+                let env = mk_new_item_env(stack, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de quantité égale")?
                     .with_parent(env);
                 Ok(stack.quantity == formula.resolve_formula_int(value, &env)?)
             }
             Self::QuantityGreater(value) => {
-                let env = stack.env(formula, env)
+                let env = mk_new_item_env(stack, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de quantité supérieure")?
                     .with_parent(env);
                 Ok(stack.quantity > formula.resolve_formula_int(value, &env)?)
             }
             Self::QuantityLess(value) => {
-                let env = stack.env(formula, env)
+                let env = mk_new_item_env(stack, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de quantité inférieure")?
                     .with_parent(env);
                 Ok(stack.quantity < formula.resolve_formula_int(value, &env)?)
             }
             Self::TraitAll(traits) => {
-                let condition_env = stack.env(formula, env)?;
+                let condition_env = mk_new_item_env(stack, formula, env)
+                    .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de traits")?;
                 // extract the traits
                 let stack_traits = condition_env
                     .get("objet")
                     .map(|obj| {
                         if let EvalValue::Object(obj_map) = obj {
-                            obj_map.get("traits").cloned()
+                            obj_map.get(&EvalKey("traits".into())).cloned()
                         } else {
                             None
                         }
@@ -1413,13 +1332,14 @@ impl ItemFilter {
                 Ok(target_traits.iter().all(|trait_name| stack_traits.contains(trait_name)))
             },
             Self::TraitAny(traits) => {
-                let condition_env = stack.env(formula, env)?;
+                let condition_env = mk_new_item_env(stack, formula, env)
+                    .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de traits")?;
                 // extract the traits
                 let stack_traits = condition_env
                     .get("objet")
                     .map(|obj| {
                         if let EvalValue::Object(obj_map) = obj {
-                            obj_map.get("traits").cloned()
+                            obj_map.get(&EvalKey("traits".into())).cloned()
                         } else {
                             None
                         }
@@ -1432,106 +1352,11 @@ impl ItemFilter {
                 Ok(target_traits.iter().any(|trait_name| stack_traits.contains(trait_name)))
             },
             Self::Formula(value) => {
-                let env = stack.env(formula, env)
+                let env = mk_new_item_env(stack, formula, env)
                     .with_context(|| "Erreur en créant l'environnement d'objet pour un filtre de formule")?
                     .with_parent(env);
-                formula.resolve_formula_bool(value, &env)
+                formula.resolve_formula_bool(value, &env).map_err(|err| anyhow!("Erreur en évaluant une formule: {}", err))
             },
-        }
-    }
-
-    /// Returns whether a formula-facing inventory snapshot satisfies this tale filter.
-    ///
-    /// Formula predicates use the supplied runtime bindings. Evaluation errors propagate
-    /// instead of being converted to a false result.
-    ///
-    /// # Arguments
-    ///
-    /// - `formula` — Formula engine used for evaluation and deterministic randomness.
-    /// - `env` — Additional formula bindings for the current lifecycle operation.
-    ///
-    /// # Errors
-    ///
-    /// Propagates formula-evaluation and nested-filter errors.
-    pub fn matches_view(
-        &self,
-        item: &FormulaItemView,
-        formula: &mut FormulaEngine,
-        env: &Env,
-    ) -> Result<bool> {
-        match self {
-            Self::And(filters) => {
-                for filter in filters.iter() {
-                    if !filter.matches_view(item, formula, env)? {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
-            }
-            Self::Or(filters) => {
-                for filter in filters.iter() {
-                    if filter.matches_view(item, formula, env)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            Self::Not(filter) => Ok(!filter.matches_view(item, formula, env)?),
-            Self::Id(id) => Ok(item.id == formula.fmt_value(id, &env.merged(&item.env()))?),
-            Self::DataEq { key, value } => {
-                let expected = formula.resolve_formula(value, &env.merged(&item.env()))?;
-                Ok(item.data.get(key).is_some_and(|actual| actual == &expected))
-            }
-            Self::DataGreater { key, value } => {
-                let expected = formula.resolve_formula_float(value, &env.merged(&item.env()))?;
-                Ok(item.data.get(key).is_some_and(|actual| actual > &expected))
-            }
-            Self::DataLess { key, value } => {
-                let expected = formula.resolve_formula_float(value, &env.merged(&item.env()))?;
-                Ok(item.data.get(key).is_some_and(|actual| actual < &expected))
-            }
-            Self::QuantityEq(value) => {
-                Ok(item.quantity == formula.resolve_formula_int(value, &env.merged(&item.env()))?)
-            }
-            Self::QuantityGreater(value) => {
-                Ok(item.quantity > formula.resolve_formula_int(value, &env.merged(&item.env()))?)
-            }
-            Self::QuantityLess(value) => {
-                Ok(item.quantity < formula.resolve_formula_int(value, &env.merged(&item.env()))?)
-            }
-            Self::TraitAll(traits) => {
-                let cond_env = item.env().with_parent(env);
-                let targets = eval_traits(traits, formula, &cond_env)
-                    .with_context(|| "Erreur lors de l'évaluation des traits d'un filtre d'objet 'tous les traits'")?;
-                let res = targets.iter().try_fold(true, |matched, trait_name| {
-                    let EvalValue::String(trait_name) = trait_name else {
-                        bail!(
-                            "Trait évalué d'un filtre d'objet 'tous les traits' \
-                            n'est pas une chaîne : {trait_name:?}"
-                        );
-                    };
-
-                    Ok(matched && item.traits.contains(trait_name))
-                })?;
-                Ok(res)
-            },
-            Self::TraitAny(traits) => {
-                let cond_env = item.env().with_parent(env);
-                let targets = eval_traits(traits, formula, &cond_env)
-                    .with_context(|| "Erreur lors de l'évaluation des traits d'un filtre d'objet 'au moins un des traits'")?;
-                let res = targets.iter().try_fold(false, |matched, trait_name| {
-                    let EvalValue::String(trait_name) = trait_name else {
-                        bail!(
-                            "Trait évalué d'un filtre d'objet 'au moins un des traits' \
-                            n'est pas une chaîne : {trait_name:?}"
-                        );
-                    };
-
-                    Ok(matched || item.traits.contains(trait_name))
-                })?;
-                Ok(res)
-            },
-            Self::Formula(value) => formula.resolve_formula_bool(value, &env.merged(&item.env())),
         }
     }
 }
@@ -1606,7 +1431,7 @@ impl TagFilter {
                     None => None,
                 }.map(|s| split_fmt_str(&s)).transpose()?;
                 Self::ValueEq{
-                    value: value_or_formula(required_value(data, "valeur", "VALEUR_EGALE")?.try_into()?)?,
+                    value: value_or_formula(json_to_eval_value(&required_value(data, "valeur", "VALEUR_EGALE")?)?)?,
                     path,
                 }
             }
@@ -1629,7 +1454,7 @@ impl TagFilter {
                     None => None,
                 }.map(|s| split_fmt_str(&s)).transpose()?;
                 Self::ValueGreater{
-                    value: value_or_formula(required_value(data, "valeur", "VALEUR_SUPERIEURE")?.try_into()?)?,
+                    value: value_or_formula(json_to_eval_value(&required_value(data, "valeur", "VALEUR_SUPERIEURE")?)?)?,
                     path,
                 }
             }
@@ -1652,12 +1477,12 @@ impl TagFilter {
                     None => None,
                 }.map(|s| split_fmt_str(&s)).transpose()?;
                 Self::ValueLess{
-                    value: value_or_formula(required_value(data, "valeur", "VALEUR_INFERIEURE")?.try_into()?)?,
+                    value: value_or_formula(json_to_eval_value(&required_value(data, "valeur", "VALEUR_INFERIEURE")?)?)?,
                     path,
                 }
             }
             "id" => Self::Id(split_fmt_str(&required_string(data, "tag", "Filtre ID")?)?),
-            "formule" => Self::Formula(value_or_formula(required_value(data, "formule", "FORMULE")?.try_into()?)?),
+            "formule" => Self::Formula(value_or_formula(json_to_eval_value(&required_value(data, "formule", "FORMULE")?)?)?),
             _ => bail!("Type de filtre de tag non supporté: {kind}"),
         })
     }
@@ -1686,13 +1511,13 @@ impl TagFilter {
             EvalValue::Object(obj) => obj,
             _ => bail!("Un filtre de tag doit être un tableau ou un objet"),
         };
-        let kind = match data.get("type") {
+        let kind = match data.get(&EvalKey("type".into())) {
             Some(EvalValue::String(s)) => s.clone(),
             _ => bail!("Un filtre de tag doit inclure un champ `type`"),
         };
         Ok(match kind.as_ref() {
             "et" => {
-                match data.get("filtres") {
+                match data.get(&EvalKey("filtres".into())) {
                     Some(EvalValue::Array(arr)) => {
                         Self::And(arr.iter().map(|item| Self::from_dict(item)).collect::<Result<Arc<_>>>()?)
                     },
@@ -1704,7 +1529,7 @@ impl TagFilter {
                 }
             },
             "ou" => {
-                match data.get("filtres") {
+                match data.get(&EvalKey("filtres".into())) {
                     Some(EvalValue::Array(arr)) => {
                         Self::Or(arr.iter().map(|item| Self::from_dict(item)).collect::<Result<Arc<_>>>()?)
                     },
@@ -1716,47 +1541,47 @@ impl TagFilter {
                 }
             },
             "non" => {
-                if let Some(filter) = data.get("filtre") {
+                if let Some(filter) = data.get(&EvalKey("filtre".into())) {
                     Self::Not(Arc::new(Self::from_dict(filter)?))
                 } else {
                     bail!("Un filtre de tag NON doit inclure un sous-filtre")
                 }
             },
             "valeur_egale" | "egale" => {
-                let path = match data.get("chemin") {
+                let path = match data.get(&EvalKey("chemin".into())) {
                     Some(EvalValue::String(s)) => Some(EvalValue::String(s.clone())),
                     Some(EvalValue::Func(f)) => Some(EvalValue::Func(f.clone())),
                     _ => None,
                 };
                 Self::ValueEq{
-                    value: data.get("valeur").cloned().ok_or_else(|| anyhow!("Le filtre de tag VALEUR_EGALE doit inclure un champ `valeur`"))?,
+                    value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("Le filtre de tag VALEUR_EGALE doit inclure un champ `valeur`"))?,
                     path,
                 }
             }
             "valeur_superieure" | "superieure" => {
-                let path = match data.get("chemin") {
+                let path = match data.get(&EvalKey("chemin".into())) {
                     Some(EvalValue::String(s)) => Some(EvalValue::String(s.clone())),
                     Some(EvalValue::Func(f)) => Some(EvalValue::Func(f.clone())),
                     _ => None,
                 };
                 Self::ValueGreater{
-                    value: data.get("valeur").cloned().ok_or_else(|| anyhow!("Le filtre de tag VALEUR_SUPERIEURE doit inclure un champ `valeur`"))?,
+                    value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("Le filtre de tag VALEUR_SUPERIEURE doit inclure un champ `valeur`"))?,
                     path,
                 }
             }
             "valeur_inferieure" | "inferieure" => {
-                let path = match data.get("chemin") {
+                let path = match data.get(&EvalKey("chemin".into())) {
                     Some(EvalValue::String(s)) => Some(EvalValue::String(s.clone())),
                     Some(EvalValue::Func(f)) => Some(EvalValue::Func(f.clone())),
                     _ => None,
                 };
                 Self::ValueLess{
-                    value: data.get("valeur").cloned().ok_or_else(|| anyhow!("Le filtre de tag VALEUR_INFERIEURE doit inclure un champ `valeur`"))?,
+                    value: data.get(&EvalKey("valeur".into())).cloned().ok_or_else(|| anyhow!("Le filtre de tag VALEUR_INFERIEURE doit inclure un champ `valeur`"))?,
                     path,
                 }
             }
             "id" => {
-                let id = match data.get("tag") {
+                let id = match data.get(&EvalKey("tag".into())) {
                     Some(EvalValue::String(s)) => EvalValue::String(s.clone()),
                     Some(EvalValue::Func(f)) => EvalValue::Func(f.clone()),
                     _ => bail!("Filtre ID doit inclure un champ `tag`"),
@@ -1764,7 +1589,7 @@ impl TagFilter {
                 Self::Id(id)
             }
             "formule" => {
-                let formula = match data.get("formule") {
+                let formula = match data.get(&EvalKey("formule".into())) {
                     Some(value) => value.clone(),
                     None => bail!("FORMULE doit inclure un champ `formule`"),
                 };
@@ -1797,7 +1622,7 @@ impl TagFilter {
         formula: &mut FormulaEngine,
         env: &Env,
     ) -> Result<bool> {
-        let charenv = character.env(formula, env)?;
+        let charenv = mk_character_env(character, formula, env)?;
         let env = charenv.merged(env);
         self.matches_with_env(tag, value, formula, &env)
     }
@@ -1892,7 +1717,7 @@ impl TagFilter {
             },
             Self::Formula(expression) => {
                 let env = tag_formula_env(tag, value).with_parent(base_env);
-                formula.resolve_formula_bool(expression, &env)
+                formula.resolve_formula_bool(expression, &env).map_err(|err| anyhow!("Erreur en évaluant une formule: {}", err))
             }
         }
     }
@@ -1907,7 +1732,7 @@ fn follow_path<'a>(target: &[&str], current: &str, value: &'a EvalValue) -> Resu
     } else if target[0] == current {
         if let EvalValue::Object(map) = value {
             let next = target[1];
-            if let Some(next_value) = map.get(next) {
+            if let Some(next_value) = map.get(&EvalKey(next.into())) {
                 follow_path(&target[1..], next, next_value).map_err(|_err| anyhow!("Le tag {} n'existe pas", target.join(".")))
             } else {
                 bail!("Le tag {current} n'inclut pas le chemin {}", target.join("."))
@@ -1940,7 +1765,7 @@ fn follow_path<'a>(target: &[&str], current: &str, value: &'a EvalValue) -> Resu
 /// - `character` — Current mutable or read-only character state.
 /// - `value` — Story-tag value exposed at the top level and through `tag.value`.
 pub fn tag_env<'a>(character: &Character, tag: &str, value: &EvalValue, formula: &mut FormulaEngine, env: &'a Env<'a>) -> Result<Env<'a>> {
-    let charenv = character.env(formula, env)?;
+    let charenv = mk_character_env(character, formula, env)?;
     Ok(charenv.expand(tag_formula_env(tag, value)).with_parent(env))
 }
 

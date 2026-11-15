@@ -6,8 +6,9 @@
 use crate::character::Character;
 use crate::effects::{Cell, ConditionEffect, Deferred, PageEffect};
 use crate::filters::{ConditionFilter, Conditional};
-use crate::formula::{
-    Env, EvalValue, FormulaEngine, FormulaFunction, Parser, Tokenizer, full_formula, split_fmt_str, validate_formula_syntax, value_or_formula
+use crate::formula::{dict_to_map, json_to_eval_value, mk_character_env, mk_connection_env, mk_partial_condition_env, mk_partial_item_env, mk_tale_env};
+use formulas::{
+    Env, EvalKey, EvalValue, FormulaEngine, FormulaFunction, Parser, Tokenizer, full_formula, split_fmt_str, validate_formula_syntax, value_or_formula
 };
 use crate::images::ImageRegistry;
 use crate::json_util::{
@@ -164,7 +165,7 @@ impl Tale {
             object_or_empty(root, "donnees")?
                 .iter()
                 .map(|(k, v)| {
-                    let value = EvalValue::try_from(v)
+                    let value = json_to_eval_value(v)
                         .with_context(|| format!("Conversion de `donnees.{k}`"))?;
                     Ok((k.as_str().into(), value))
                 })
@@ -176,7 +177,7 @@ impl Tale {
             object_or_empty(root, "tags")?
                 .iter()
                 .map(|(key, value)| {
-                    let value = EvalValue::try_from(value)
+                    let value = json_to_eval_value(value)
                         .with_context(|| format!("Conversion du tag initial `{key}`"))?;
                     Ok((key.as_str().into(), value))
                 })
@@ -395,7 +396,10 @@ impl Tale {
 
     pub fn env(&self) -> Env<'static> {
         let mut env = Env::new();
-        env.insert("recit", EvalValue::Object(self.data.clone()));
+        let data: IndexMap<EvalKey, EvalValue> = self.data.iter()
+            .map(|(k, v)| (EvalKey(EvalValue::String(k.clone().into())), v.clone()))
+            .collect();
+        env.insert("recit", EvalValue::Object(data.into()));
         env
     }
 }
@@ -414,7 +418,7 @@ fn parse_global_values(value: Option<&JsonValue>) -> Result<IndexMap<Arc<str>, E
     let raw = object
         .iter()
         .map(|(key, value)| {
-            let value = EvalValue::try_from(value)
+            let value = json_to_eval_value(value)
                 .with_context(|| format!("Conversion de la valeur globale `{key}`"))?;
             Ok((Arc::from(key.as_str()), value))
         })
@@ -423,8 +427,11 @@ fn parse_global_values(value: Option<&JsonValue>) -> Result<IndexMap<Arc<str>, E
     let mut formula = FormulaEngine::new(None);
 
     for (key, value) in raw.iter() {
-        let mut env = Env::from_tale_globals(&values);
-        env.insert("recit", EvalValue::Object(Arc::new(values.clone())));
+        let mut env = mk_tale_env(&values)?;
+        let map = values.iter()
+            .map(|(k, v)| (EvalKey(EvalValue::String(k.clone().into())), v.clone()))
+            .collect::<IndexMap<_, _>>();
+        env.insert("recit", EvalValue::Object(Arc::new(map)));
         let resolved = resolve_global_value(value, &mut formula, &env)
             .with_context(|| format!("Valeur globale `{key}` invalide"))?;
         values.insert(key.clone(), resolved);
@@ -459,14 +466,17 @@ fn resolve_global_value(
             }
             Ok(EvalValue::Object(resolved.into()))
         }
-        _ => formula.resolve(value, env),
+        _ => formula.resolve(value, env).map_err(|_| anyhow!("Echec lors de l'évaluation d'une formule globale")),
     }
 }
 
 fn eval_initial_tags(initial_tags: IndexMap<Arc<str>, EvalValue>, data: &IndexMap<Arc<str>, EvalValue>) -> Result<IndexMap<Arc<str>, EvalValue>> {
     let mut formula = FormulaEngine::new(None);
     let mut env = Env::new();
-    env.insert("recit", EvalValue::Object(Arc::new(data.clone())));
+    let map: IndexMap<EvalKey, EvalValue> = data.iter()
+        .map(|(k, v)| (EvalKey(EvalValue::String(k.clone().into())), v.clone()))
+        .collect();
+    env.insert("recit", EvalValue::Object(Arc::new(map)));
     let mut resolved_tags = IndexMap::new();
     for (key, value) in initial_tags {
         let resolved = resolve_initial_tags(&value, &mut formula, &env)
@@ -690,7 +700,7 @@ pub struct Item {
     pub name: EvalValue,
     pub description: EvalValue,
     pub traits: Arc<[Deferred<Arc<str>>]>,
-    pub data: IndexMap<Arc<str>, EvalValue>,
+    pub data: IndexMap<EvalKey, EvalValue>,
 }
 
 impl Item {
@@ -709,10 +719,10 @@ impl Item {
             .iter()
             .map(|tup| {
                 let (k, v) = tup;
-                let eval_value: EvalValue = value_or_formula(v.clone().try_into()?)?;
-                Ok((k.clone().into(), eval_value))
+                let eval_value: EvalValue = value_or_formula(json_to_eval_value(v)?)?;
+                Ok((EvalKey(EvalValue::String(k.clone().into())), eval_value))
             })
-            .collect::<Result<IndexMap<Arc<str>, EvalValue>>>()?;
+            .collect::<Result<IndexMap<EvalKey, EvalValue>>>()?;
         Ok(Self {
             id: id.into(),
             name,
@@ -743,7 +753,7 @@ impl Item {
         };
         let mut data = self.data.clone();
         data.extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
-        let mut source_env = Env::from_index_map(&data).with_parent(env);
+        let mut source_env = Env::from_arc(Arc::new(dict_to_map(data.clone())?)).with_parent(env);
         source_env.insert("id", EvalValue::String(self.id.clone()));
         for (key, value) in &mut data {
             *value = formula
@@ -751,7 +761,10 @@ impl Item {
                 .with_context(|| {
                     format!("Résolution de `donnees.{key}` pour l'objet `{}`", self.id)
                 })?;
-            source_env.insert(key.clone(), value.clone());
+            let EvalKey(EvalValue::String(key_str)) = key else {
+                bail!("Clé non valide dans les données de l'objet");
+            };
+            source_env.insert(key_str.clone(), value.clone());
         }
         Ok(ItemStack {
             item: self.clone(),
@@ -766,59 +779,10 @@ impl Item {
 pub struct ItemStack {
     pub item: Arc<Item>,
     pub quantity: i64,
-    pub data: Arc<IndexMap<Arc<str>, EvalValue>>,
+    pub data: Arc<IndexMap<EvalKey, EvalValue>>,
 }
 
 impl ItemStack {
-    /// Builds the formula environment exposed by the current runtime value.
-    ///
-    /// The returned environment owns cloned bindings, so callers may extend it without
-    /// mutating the source character, page, item, or state.
-    /// Builds the formula environment exposed by the current runtime value.
-    ///
-    /// The returned environment owns cloned bindings, so callers may extend it without
-    /// mutating the source character, page, item, or state.
-    pub fn env(&self, formula: &mut FormulaEngine, env: &Env) -> Result<Env<'static>> {
-        let mut base_env = Env::new();
-        let mut obj = IndexMap::new();
-        for (key, value) in self.data.iter() {
-            base_env.insert(key.clone(), value.clone());
-        }
-        obj.insert("id".into(), EvalValue::String(self.item.id.clone()));
-        obj.insert("donnees".into(), EvalValue::Object(self.data.clone()));
-
-        let mut mini_env = Env::new().with_parent(env);
-        mini_env.insert("id", EvalValue::String(self.item.id.clone()));
-        mini_env.insert("objet", EvalValue::Object(obj.clone().into()));
-        let traits = eval_traits(&self.item.traits, formula, &mini_env)
-            .with_context(|| format!("Évaluation des traits de l'objet `{}`", self.item.id))?;
-        obj.insert("traits".into(), EvalValue::Array(traits));
-
-        base_env.insert("objet", EvalValue::Object(Arc::from(obj)));
-        base_env.insert("id", EvalValue::String(self.item.id.clone()));
-        Ok(base_env)
-    }
-    /*
-    pub fn nonactual_env(&self) -> Env<'static> {
-        let mut base_env = Env::new();
-        let mut obj = IndexMap::new();
-        for (key, value) in self.data.iter() {
-            base_env.insert(key.clone(), value.clone());
-        }
-        obj.insert("id".into(), EvalValue::String(self.item.id.clone()));
-        obj.insert("donnees".into(), EvalValue::Object(self.data.clone()));
-        obj.insert("traits".into(), EvalValue::Array(
-            self.item.traits.iter().filter_map(|t| match t {
-                Deferred::Literal(s) => Some(EvalValue::String(s.clone())),
-                _ => None,
-            }).collect::<Vec<_>>()
-            .into()
-        ));
-        base_env.insert("objet", EvalValue::Object(Arc::from(obj)));
-        base_env.insert("id", EvalValue::String(self.item.id.clone()));
-        base_env
-    }
-    */
     /// Formats the item name using the stack metadata plus `base_env`.
     ///
     /// `base_env` bindings take precedence over stack bindings with the same name.
@@ -827,8 +791,8 @@ impl ItemStack {
     ///
     /// Propagates formula-formatting errors.
     pub fn actual_name(&self, formula: &mut FormulaEngine, base_env: &Env) -> Result<Arc<str>> {
-        let env = self.env(formula, base_env)
-            .with_context(|| format!("Calcul du nom de l'objet {}", self.item.id))?
+        let env = mk_partial_item_env(self)
+            .with_context(|| format!("Calcul de la vue partielle de l'objet {}", self.item.id))?
             .with_parent(base_env);
         formula
             .fmt_value(&self.item.name, &env)
@@ -852,7 +816,7 @@ impl ItemStack {
         formula: &mut FormulaEngine,
         base_env: &Env,
     ) -> Result<Arc<str>> {
-        let env = self.env(formula, base_env)
+        let env = mk_partial_item_env(self)
             .with_context(|| format!("Calcul de la description de l'objet {}", self.item.id))?
             .with_parent(base_env);
         formula
@@ -867,49 +831,14 @@ impl ItemStack {
     }
     /// Returns metadata `key`, preferring the instantiated override over the template value.
     pub fn get_data(&self, key: &str) -> Option<&EvalValue> {
-        self.data.get(key).or_else(|| self.item.data.get(key))
+        let key = EvalKey(EvalValue::String(key.into()));
+        self.data.get(&key).or_else(|| self.item.data.get(&key))
     }
     /// Returns merged template metadata and instance overrides.
     ///
     /// Instance values replace template values with the same key; no formula evaluation occurs.
-    pub fn actual_data(&self) -> Arc<IndexMap<Arc<str>, EvalValue>> {
+    pub fn actual_data(&self) -> Arc<IndexMap<EvalKey, EvalValue>> {
         self.data.clone()
-    }
-    /// Builds the stack object supplied to lifecycle formulas and notifications.
-    ///
-    /// The returned object includes the formatted name and description, traits, the resolved `donnees`
-    /// object, and each data field at the top level.
-    ///
-    /// # Errors
-    ///
-    /// Propagates name or description formatting errors.
-    pub fn resolved_metadata(
-        &self,
-        formula: &mut FormulaEngine,
-        base_env: &Env,
-    ) -> Result<IndexMap<Arc<str>, EvalValue>> {
-        let mut values = IndexMap::new();
-        for (key, value) in self.data.iter() {
-            values.insert(key.clone(), value.clone());
-        }
-        values.insert("id".into(), EvalValue::String(self.item.id.clone()));
-        values.insert(
-            "nom".into(),
-            EvalValue::String(self.actual_name(formula, base_env)?),
-        );
-        values.insert(
-            "description".into(),
-            EvalValue::String(self.actual_description(formula, base_env)?),
-        );
-        values.insert("quantite".into(), EvalValue::Int(self.quantity));
-        let env = self.env(formula, base_env)
-            .with_context(|| format!("Erreur en évaluant l'environement d'un etat {}", self.item.id))?
-            .with_parent(base_env);
-        let traits = eval_traits(&self.item.traits, formula, &env)
-            .with_context(|| format!("Erreur en évaluant les traits d'une instance de l'etat {}", self.item.id))?;
-        values.insert("traits".into(), EvalValue::Array(traits));
-        values.insert("donnees".into(), EvalValue::Object(self.data.clone()));
-        Ok(values)
     }
 }
 
@@ -919,7 +848,7 @@ pub struct ConditionTemplate {
     pub id: Arc<str>,
     pub name: EvalValue,
     pub description: EvalValue,
-    pub data: IndexMap<Arc<str>, EvalValue>,
+    pub data: IndexMap<EvalKey, EvalValue>,
     pub effects: Vec<ConditionEffect>,
     pub traits: Arc<[Deferred<Arc<str>>]>,
     pub expiration: Option<ConditionFilter>,
@@ -944,10 +873,10 @@ impl ConditionTemplate {
             .iter()
             .map(|tup| {
                 let (k, v) = tup;
-                let eval_value: EvalValue = value_or_formula(v.clone().try_into()?)?;
-                Ok((k.clone().into(), eval_value))
+                let eval_value: EvalValue = value_or_formula(json_to_eval_value(v)?)?;
+                Ok((EvalKey(EvalValue::from(k.clone())), eval_value))
             })
-            .collect::<Result<IndexMap<Arc<str>, EvalValue>>>()?;
+            .collect::<Result<IndexMap<EvalKey, EvalValue>>>()?;
         let traits = collect_traits(data.get("traits"))
             .with_context(|| format!("Erreur en parsant les traits de l'état {id}"))?;
         let effects = array_or_empty(data, "effets")?
@@ -1009,18 +938,19 @@ impl ConditionTemplate {
         for (key, value) in work_data.iter_mut() {
             let cenv = {
                 let mut obj = IndexMap::new();
-                obj.insert("id".into(), EvalValue::String(self.id.clone()));
-                obj.insert("donnees".into(), EvalValue::Object(merged.clone()));
+                obj.insert(EvalKey("id".into()), EvalValue::String(self.id.clone()));
+                obj.insert(EvalKey("donnees".into()), EvalValue::Object(merged.clone()));
 
                 let mini_env = {
-                    let mut mini_env = Env::from_index_map(&shadow).with_parent(env);
+                    let map = Arc::new(dict_to_map(shadow.clone())?);
+                    let mut mini_env = Env::from_arc(map).with_parent(env);
                     mini_env.insert("etat", EvalValue::Object(Arc::from(obj.clone())));
                     mini_env
                 };
                 let traits = eval_traits(&self.traits, formula, &mini_env)
                     .with_context(|| format!("Erreur en évaluant les traits d'une instance de l'etat {}", self.id))?;
                 obj.insert(
-                    "traits".into(),
+                    EvalKey("traits".into()),
                     EvalValue::Array(traits),
                 );
 
@@ -1047,7 +977,7 @@ impl ConditionTemplate {
 #[derive(Clone, Debug)]
 pub struct ConditionInstance {
     pub template: Arc<ConditionTemplate>,
-    pub data: Arc<IndexMap<Arc<str>, EvalValue>>,
+    pub data: Arc<IndexMap<EvalKey, EvalValue>>,
 }
 
 impl ConditionInstance {
@@ -1057,7 +987,7 @@ impl ConditionInstance {
     ///
     /// Propagates formula-formatting errors.
     pub fn actual_name(&self, formula: &mut FormulaEngine, env: &Env) -> Result<Arc<str>> {
-        let env = self.env(formula, env)
+        let env = mk_partial_condition_env(self)
             .with_context(|| format!("Erreur en évaluant l'environement d'un etat {}", self.template.id))?
             .with_parent(env);
         formula
@@ -1076,7 +1006,7 @@ impl ConditionInstance {
     ///
     /// Propagates formula-formatting errors.
     pub fn actual_description(&self, formula: &mut FormulaEngine, env: &Env) -> Result<Arc<str>> {
-        let env = self.env(formula, env)
+        let env = mk_partial_condition_env(self)
             .with_context(|| format!("Erreur en évaluant l'environement d'un etat {}", self.template.id))?
             .with_parent(env);
         formula
@@ -1089,41 +1019,6 @@ impl ConditionInstance {
                 )
             })
     }
-    /// Builds the state object supplied to lifecycle formulas and notifications.
-    ///
-    /// The returned object includes the formatted name and description, traits, the resolved `donnees`
-    /// object, and each data field at the top level.
-    ///
-    /// # Errors
-    ///
-    /// Propagates name or description formatting errors.
-    pub fn resolved_metadata(
-        &self,
-        formula: &mut FormulaEngine,
-        base_env: &Env,
-    ) -> Result<IndexMap<Arc<str>, EvalValue>> {
-        let mut values = IndexMap::new();
-        for (key, value) in self.data.iter() {
-            values.insert(key.clone(), value.clone());
-        }
-        values.insert("id".into(), EvalValue::String(self.template.id.clone()));
-        values.insert(
-            "nom".into(),
-            EvalValue::String(self.actual_name(formula, base_env)?),
-        );
-        values.insert(
-            "description".into(),
-            EvalValue::String(self.actual_description(formula, base_env)?),
-        );
-        let env = self.env(formula, base_env)
-            .with_context(|| format!("Erreur en évaluant l'environement d'un etat {}", self.template.id))?
-            .with_parent(base_env);
-        let traits = eval_traits(&self.template.traits, formula, &env)
-            .with_context(|| format!("Erreur en évaluant les traits d'une instance de l'etat {}", self.template.id))?;
-        values.insert("traits".into(), EvalValue::Array(traits));
-        values.insert("donnees".into(), EvalValue::Object(self.data.clone()));
-        Ok(values)
-    }
     /// Evaluates this instance's expiration filter.
     ///
     /// A state without an expiration filter never expires.
@@ -1132,7 +1027,7 @@ impl ConditionInstance {
     ///
     /// Propagates filter or formula evaluation errors.
     pub fn is_expired(&self, formula: &mut FormulaEngine, env: &Env) -> Result<bool> {
-        let env = self.env(formula, env)
+        let env = mk_partial_condition_env(self)
             .with_context(|| format!("Erreur en évaluant l'environement d'un etat {}", self.template.id))?
             .with_parent(env);
         match &self.template.expiration {
@@ -1140,31 +1035,9 @@ impl ConditionInstance {
             None => Ok(false),
         }
     }
-    /// Builds the formula environment exposed by the current runtime value.
-    ///
-    /// The returned environment owns cloned bindings, so callers may extend it without
-    /// mutating the source character, page, item, or state.
-    pub fn env(&self, formula: &mut FormulaEngine, env: &Env) -> Result<Env<'static>> {
-        let mut base_env = Env::new();
-        let mut obj = IndexMap::new();
-        let mut mini_obj = IndexMap::new();
-        for (key, value) in self.data.iter() {
-            base_env.insert(key.clone(), value.clone());
-            mini_obj.insert(key.clone(), value.clone());
-        }
-
-        obj.insert("id".into(), EvalValue::String(self.template.id.clone()));
-        obj.insert("donnees".into(), EvalValue::Object(self.data.clone()));
-
-        mini_obj.insert("etat".into(), EvalValue::Object(Arc::from(obj.clone())));
-        let mini_env = Env::from_index_map(&mini_obj).with_parent(env);
-        let traits = eval_traits(&self.template.traits, formula, &mini_env)
-            .with_context(|| format!("Erreur en évaluant les traits d'une instance de l'etat {}", self.template.id))?;
-        obj.insert("traits".into(), EvalValue::Array(traits));
-
-        base_env.insert("etat", EvalValue::Object(Arc::from(obj)));
-        base_env.insert("id", EvalValue::String(self.template.id.clone()));
-        Ok(base_env)
+    
+    pub fn actual_data(&self) -> Arc<IndexMap<EvalKey, EvalValue>> {
+        Arc::clone(&self.data)
     }
 }
 
@@ -1191,11 +1064,11 @@ impl Check {
             other => bail!("Le champ `attribut` d'un test doit être une chaîne de caractères ou null, trouvé: {:?}", other),
         };
         let difficulty = value_or_formula(
-            data
+            json_to_eval_value(&data
                 .get("difficulte")
                 .cloned()
                 .unwrap_or(JsonValue::from(10))
-                .try_into()?,
+            )?,
         )?;
         let traits = match data.get("traits") {
             None => Vec::new(),
@@ -1221,17 +1094,17 @@ impl Check {
             EvalValue::Object(map) => map,
             _ => bail!("Un test doit être un dictionnaire"),
         };
-        let attribute = match data.get("attribut") {
+        let attribute = match data.get(&EvalKey(EvalValue::String("attribut".into()))) {
             Some(EvalValue::String(s)) => EvalValue::String(s.clone()),
             Some(EvalValue::Func(f)) => EvalValue::Func(f.clone()),
             Some(EvalValue::Null) | None => EvalValue::Null,
             _ => bail!("Un test doit inclure un champ `attribut`"),
         };
         let difficulty = data
-            .get("difficulte")
+            .get(&EvalKey(EvalValue::String("difficulte".into())))
             .cloned()
             .unwrap_or(EvalValue::Int(10));
-        let traits = match data.get("traits") {
+        let traits = match data.get(&EvalKey(EvalValue::String("traits".into()))) {
             Some(EvalValue::Array(arr)) => arr
                 .iter()
                 .map(|v| match v {
@@ -1243,7 +1116,7 @@ impl Check {
             _ => bail!("Le champ `traits` d'un test doit être une liste"),
         }
         .into();
-        let failure = match data.get("echec") {
+        let failure = match data.get(&EvalKey(EvalValue::String("echec".into()))) {
             Some(EvalValue::String(s)) => Some(EvalValue::String(s.clone())),
             Some(EvalValue::Func(f)) => Some(EvalValue::Func(f.clone())),
             Some(EvalValue::Null) | None => None,
@@ -1270,8 +1143,7 @@ impl Check {
         formula: &mut FormulaEngine,
         env: &Env,
     ) -> Result<CheckResult> {
-        let base_env = character
-            .env(formula, env)
+        let base_env = mk_character_env(character, formula, env)
             .context("Construction de l'environnement du test")?;
         let base_env = base_env.merged(env);
         let attr = match &self.attribute {
@@ -1308,7 +1180,7 @@ impl Check {
                     )
                 })?;
         let roll = formula.d20();
-        let charenv = character.env(formula, env)?;
+        let charenv = mk_character_env(character, formula, env)?;
         let tenv = charenv.merged(env);
         let target = formula
             .resolve_formula_int(&self.difficulty, &tenv)
@@ -1349,28 +1221,28 @@ pub struct CheckResult {
 }
 impl CheckResult {
     /// Returns the check outcome dictionary exposed to connection-cell formulas as `test`.
-    pub fn into_dict(&self) -> IndexMap<Arc<str>, EvalValue> {
+    pub fn into_dict(&self) -> IndexMap<EvalKey, EvalValue> {
         let mut dict = IndexMap::new();
-        dict.insert("resultat".into(), EvalValue::Bool(self.success));
-        dict.insert("difficulte".into(), EvalValue::Int(self.difficulty));
-        dict.insert("modificateur".into(), EvalValue::Int(self.modifier));
-        dict.insert("jet".into(), EvalValue::Int(self.roll));
-        dict.insert("attribut".into(), match &self.attribute {
+        dict.insert(EvalKey(EvalValue::String("resultat".into())), EvalValue::Bool(self.success));
+        dict.insert(EvalKey(EvalValue::String("difficulte".into())), EvalValue::Int(self.difficulty));
+        dict.insert(EvalKey(EvalValue::String("modificateur".into())), EvalValue::Int(self.modifier));
+        dict.insert(EvalKey(EvalValue::String("jet".into())), EvalValue::Int(self.roll));
+        dict.insert(EvalKey(EvalValue::String("attribut".into())), match &self.attribute {
             Some(s) => EvalValue::String(s.clone()),
             None => EvalValue::Null,
         });
         dict.insert(
-            "valeur_attribut".into(),
+            EvalKey(EvalValue::String("valeur_attribut".into())),
             EvalValue::Int(self.attribute_value),
         );
-        dict.insert("total".into(), EvalValue::Int(self.total));
+        dict.insert(EvalKey(EvalValue::String("total".into())), EvalValue::Int(self.total));
         dict.insert(
-            "total_modificateur".into(),
+            EvalKey(EvalValue::String("total_modificateur".into())),
             EvalValue::Int(self.total_modifier),
         );
-        dict.insert("marge".into(), EvalValue::Int(self.margin));
+        dict.insert(EvalKey(EvalValue::String("marge".into())), EvalValue::Int(self.margin));
         dict.insert(
-            "traits".into(),
+            EvalKey(EvalValue::String("traits".into())),
             EvalValue::Array(self.traits.iter().cloned().map(EvalValue::String).collect()),
         );
         dict
@@ -1386,7 +1258,7 @@ pub struct Connection {
     pub check: Option<Check>,
     /// Cells carried to the destination whenever this connection is selected.
     pub cells: Arc<[Deferred<Cell>]>,
-    pub tags: IndexMap<Arc<str>, EvalValue>,
+    pub tags: IndexMap<EvalKey, EvalValue>,
 }
 
 impl Connection {
@@ -1506,7 +1378,7 @@ impl Connection {
             _ => bail!("Une connexion doit être un dictionnaire"),
         };
         let destination = match data
-            .get("destination")
+            .get(&EvalKey(EvalValue::String("destination".into())))
             .ok_or_else(|| anyhow!("Une connexion doit avoir une destination"))?
         {
             EvalValue::String(s) => EvalValue::String(s.clone()),
@@ -1514,14 +1386,14 @@ impl Connection {
             autre => bail!("La destination d'une connexion doit être une chaîne de caractères ou une formule (reçu {autre})"),
         };
         let text = match data
-            .get("texte")
+            .get(&EvalKey(EvalValue::String("texte".into())))
             .ok_or_else(|| anyhow!("Une connexion doit avoir un texte"))?
         {
             EvalValue::String(s) => EvalValue::String(s.clone()),
             EvalValue::Func(f) => EvalValue::Func(f.clone()),
             autre => bail!("Le texte d'une connexion doit être une chaîne de caractères ou une formule (reçu {autre})"),
         };
-        let conditional = match data.get("conditions") {
+        let conditional = match data.get(&EvalKey(EvalValue::String("conditions".into()))) {
             Some(cond) => {
                 if cond == &EvalValue::Null {
                     None
@@ -1531,7 +1403,7 @@ impl Connection {
             }
             None => None,
         };
-        let check = match data.get("test") {
+        let check = match data.get(&EvalKey(EvalValue::String("test".into()))) {
             Some(check_value) => {
                 if check_value == &EvalValue::Null {
                     None
@@ -1541,11 +1413,11 @@ impl Connection {
             }
             None => None,
         };
-        let cells = data.get("cellules");
+        let cells = data.get(&EvalKey(EvalValue::String("cellules".into())));
         let cells = Cell::parse_many_from_value(cells.unwrap_or(&EvalValue::Null), "Connexion à partir d'une valeur")
             .with_context(|| "Erreur en parsant les cellules d'une connexion")?
             .into();
-        let tags = match data.get("tags") {
+        let tags = match data.get(&EvalKey(EvalValue::String("tags".into()))) {
             Some(EvalValue::Object(obj)) => {
                 obj.iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
@@ -1576,8 +1448,8 @@ impl Connection {
     pub fn valid(
         &self,
         character: &Character,
-        page_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
-        connection_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
+        page_tags: Arc<IndexMap<EvalKey, EvalValue>>,
+        connection_tags: Arc<IndexMap<EvalKey, EvalValue>>,
         tale: &Tale,
         env: &Env,
         formula: &mut FormulaEngine,
@@ -1705,8 +1577,7 @@ impl Connection {
                 .context("Erreur lors de l'évaluation de la destination d'une connexion")?,
             _ => self.resolved_destination(formula, &selection_env)?,
         };
-        let connection_env = self
-            .env(formula, &selection_env)
+        let connection_env = mk_connection_env(self, formula, env)
             .context("Évaluation des tags de la connexion sélectionnée")?;
 
         Ok(PageResult {
@@ -1716,22 +1587,6 @@ impl Connection {
             connection_env,
         })
     }
-
-    /// Builds the formula environment exposed by the current runtime value.
-    ///
-    /// The env arg is used purely to resolve formulas in the page's tags; it is not retained in the returned environment.
-    /// 
-    /// The returned environment owns cloned bindings, so callers may extend it without
-    /// mutating the source character, page, item, or state.
-    /// 
-    /// env should contain `recit`, `page`, `test`, `connexion` (from the current/previous page) and `personnage`
-    pub fn env(&self, formula: &mut FormulaEngine, env: &Env) -> Result<Env<'static>> {
-        let mut work = Env::new();
-        let tags = eval_tags(&self.tags, formula, env)
-            .context("Erreur en évaluant les tags de la connexion")?;
-        work.insert("connexion", EvalValue::Object(tags.into()));
-        Ok(work)
-    }
 }
 
 /// Stores the immutable tags, ordered cells, and connections for a tale page.
@@ -1740,7 +1595,7 @@ pub struct Page {
     pub id: Arc<str>,
     pub title: EvalValue,
     /// Immutable metadata exposed to formulas through the `page` object.
-    pub tags: Arc<IndexMap<Arc<str>, EvalValue>>,
+    pub tags: Arc<IndexMap<EvalKey, EvalValue>>,
     /// Ordered narrative and effect cells executed on entry.
     pub cells: Arc<[Deferred<Cell>]>,
     pub connections: Arc<[Deferred<Connection>]>,
@@ -1782,22 +1637,6 @@ impl Page {
         })
     }
 
-    /// Builds the formula environment exposed by the current runtime value.
-    ///
-    /// The env arg is used purely to resolve formulas in the page's tags; it is not retained in the returned environment.
-    /// 
-    /// The returned environment owns cloned bindings, so callers may extend it without
-    /// mutating the source character, page, item, or state.
-    /// 
-    /// env should contain only `recit`, the selected connection's `test`, and its
-    /// immutable `connexion` tags. In particular, page tags do not read `personnage`.
-    pub fn env(&self, formula: &mut FormulaEngine, env: &Env) -> Result<Env<'static>> {
-        let mut work = Env::new();
-        let tags = eval_tags(&self.tags, formula, env)
-            .with_context(|| format!("Erreur en évaluant les tags de la page `{}`", self.id))?;
-        work.insert("page", EvalValue::Object(tags.into()));
-        Ok(work)
-    }
     /// Formats the page title with character and immutable page-tag bindings.
     ///
     /// env should contain `recit`, `test`, `connexion`, `page` (this page) and `personnage`.
@@ -1869,12 +1708,12 @@ pub struct PageResult {
 fn parse_dyn_connection(value: &JsonValue) -> Result<EvalValue> {
     let val = match value {
         JsonValue::String(s) => {
-            crate::formula::value_or_formula(EvalValue::String(s.clone().into()))
+            formulas::value_or_formula(EvalValue::String(s.clone().into()))
         },
         JsonValue::Object(obj) => {
             if let Some(formula) = obj.get("formule") {
                 if let JsonValue::String(s) = formula {
-                    crate::formula::value_or_formula(EvalValue::String(s.clone().into()))
+                    formulas::value_or_formula(EvalValue::String(s.clone().into()))
                 } else {
                     bail!("Le champ `formule` d'une connexion dynamique doit être une formule");
                 }
@@ -1891,24 +1730,24 @@ fn parse_dyn_connection(value: &JsonValue) -> Result<EvalValue> {
 }
 
 /// Parse and collects tags for pages and connections. Tags are expected to be a dictionary of string keys to values or formulas.
-pub fn collect_tags(value: Option<&JsonValue>) -> Result<IndexMap<Arc<str>, EvalValue>> {
+pub fn collect_tags(value: Option<&JsonValue>) -> Result<IndexMap<EvalKey, EvalValue>> {
     match value {
         None | Some(JsonValue::Null) => Ok(IndexMap::new()),
         Some(JsonValue::Object(obj)) => obj
             .iter()
             .map(|(key, value)| {
-                let val = value_or_formula(EvalValue::try_from(value)
+                let val = formulas::value_or_formula(json_to_eval_value(value)
                     .map_err(|err| anyhow::Error::from(err))
                     .with_context(|| format!("Erreur en lisant le tag `{key}`"))?)
                     .with_context(|| format!("Erreur en évaluant le tag `{key}`"))?;
-                Ok((key.clone().into(), val))
+                Ok((EvalKey(EvalValue::from(key.clone())), val))
             })
-            .collect::<Result<IndexMap<Arc<str>, EvalValue>>>(),
+            .collect::<Result<IndexMap<EvalKey, EvalValue>>>(),
         Some(_) => bail!("Le champ `tags` doit être un dictionnaire"),
     }
 }
 /// Evaluates all tags in a given dictionary, resolving any formulas with the provided formula engine and environment.
-pub fn eval_tags(tags: &IndexMap<Arc<str>, EvalValue>, formula: &mut FormulaEngine, env: &Env) -> Result<IndexMap<Arc<str>, EvalValue>> {
+pub fn eval_tags(tags: &IndexMap<EvalKey, EvalValue>, formula: &mut FormulaEngine, env: &Env) -> Result<IndexMap<EvalKey, EvalValue>> {
     let mut evaluated_tags = IndexMap::new();
     for (key, value) in tags.iter() {
         let evaluated_value = formula.resolve_formula(value, env)
@@ -1986,13 +1825,13 @@ pub fn collect_data(value: Option<&JsonValue>) -> Result<EvalValue> {
         Some(JsonValue::Object(obj)) => obj
             .iter()
             .map(|(key, value)| {
-                let val = value_or_formula(EvalValue::try_from(value)
+                let val = value_or_formula(json_to_eval_value(value)
                     .map_err(|err| anyhow::Error::from(err))
                     .with_context(|| format!("Erreur en lisant le champ de données `{key}`"))?)
                     .with_context(|| format!("Erreur en évaluant le champ de données `{key}`"))?;
-                Ok((key.clone().into(), val))
+                Ok((EvalKey(EvalValue::from(key.clone())), val))
             })
-            .collect::<Result<IndexMap<Arc<str>, EvalValue>>>()
+            .collect::<Result<IndexMap<EvalKey, EvalValue>>>()
             .map(|map| EvalValue::Object(map.into())),
         Some(JsonValue::String(s)) => {
             let val = value_or_formula(EvalValue::String(s.clone().into()))
@@ -2013,18 +1852,20 @@ pub fn collect_traits(value: Option<&JsonValue>) -> Result<Arc<[Deferred<Arc<str
             .map(|v| {
                 if let JsonValue::String(s) = v {
                     value_or_formula(s.as_str().into())
+                        .map_err(|err| anyhow!("Erreur en évaluant le trait: {}", err))
                         .and_then(|val| match val {
                             EvalValue::String(s) => Ok(Deferred::Literal(s)),
                             EvalValue::Func(_) => Ok(Deferred::Formula(val)),
-                            _ => bail!("Chaque trait doit être une chaîne de caractères ou une formule, reçu {}", val.diagnostic()),
+                            _ => Err(anyhow!("Chaque trait doit être une chaîne de caractères ou une formule, reçu {}", val.diagnostic())),
                         })
                 } else {
-                    bail!("Chaque trait doit être une chaîne de caractères, reçu {}", v)
+                    Err(anyhow!("Chaque trait doit être une chaîne de caractères, reçu {}", v))
                 }
             })
             .collect::<Result<Arc<[Deferred<Arc<str>>]>>>(),
         Some(JsonValue::String(s)) => {
             value_or_formula(s.as_str().into())
+                .map_err(|err| anyhow!("Erreur en évaluant le trait: {}", err))
                 .and_then(|val| match val {
                     EvalValue::String(s) => Ok(Arc::from([Deferred::Literal(s)])),
                     EvalValue::Func(_) => Ok(Arc::from([Deferred::Formula(val)])),
@@ -2119,7 +1960,7 @@ mod global_tests {
         assert_eq!(tale.data.get("answer"), Some(&EvalValue::Int(42)));
         assert_eq!(
             tale.data.get("nested").and_then(|value| match value {
-                EvalValue::Object(values) => values.get("value"),
+                EvalValue::Object(values) => values.get(&EvalKey(EvalValue::String("value".into()))),
                 _ => None,
             }),
             Some(&EvalValue::Int(5))

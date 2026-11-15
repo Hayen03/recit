@@ -9,11 +9,12 @@ use std::sync::Arc;
 use crate::character::Character;
 use crate::engine::{Interaction, Terminal};
 use crate::filters::{CheckFilter, ConditionFilter, Conditional, ItemFilter, TagFilter};
-use crate::formula::{Env, EvalValue, FormulaEngine, split_fmt_str, value_or_formula};
+use crate::formula::{dict_to_map, json_to_eval_value, mk_character_base_env, mk_character_env, mk_condition_env, mk_item_env, mk_partial_condition_env, mk_partial_item_env, resolve_formula_quantity};
+use formulas::{Env, EvalKey, EvalValue, FormulaEngine, split_fmt_str, value_or_formula};
 use crate::json_util::{
     object, optional_string, required_string, required_value, value_or,
 };
-use crate::model::{ConditionInstance, ItemStack, Modifier, Tale, collect_data};
+use crate::model::{Modifier, Tale, collect_data};
 use crate::polls::{PollRequest, PollRequestData, PollRequestDataType, PollRequestOption};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -52,7 +53,7 @@ impl ConditionEffect {
         let data = object(value, "Un effet d'état")?;
         let kind = required_string(data, "type", "Un effet d'état")?;
         let category = optional_string(data, "categorie")?.map(Arc::from);
-        let amount = value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?;
+        let amount = value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?;
         Ok(match kind.as_str() {
             "modificateur_attribut" => Self::AttributeModifier {
                 attribute: {
@@ -71,7 +72,7 @@ impl ConditionEffect {
                         Some(JsonValue::Array(arr)) => {
                             let mut result = Vec::new();
                             for item in arr {
-                                let full_form = value_or_formula(item.try_into()?)
+                                let full_form = value_or_formula(json_to_eval_value(item)?)
                                     .with_context(|| "Analysant la formule d'attribut")?;
                                 match full_form {
                                     EvalValue::Func(_) => result.push(Deferred::Formula(full_form)),
@@ -166,7 +167,7 @@ impl ConditionEffect {
         &self,
         attribute: Option<Arc<str>>,
         traits: &[Arc<str>],
-        condition_data: &IndexMap<Arc<str>, EvalValue>,
+        condition_data: &IndexMap<EvalKey, EvalValue>,
         character: &Character,
         formula: &mut FormulaEngine,
         env: &Env,
@@ -177,16 +178,16 @@ impl ConditionEffect {
                 value,
                 filter,
             } => {
-                let mut env = Env::from_index_map(condition_data)
-                    .expand(character.base_env(formula, env)?)
+                let mut env = Env::from_arc(dict_to_map(condition_data.clone())?.into())
+                    .expand(mk_character_base_env(character, formula, env)?)
                     .with_parent(env);
                 {
                     let mut check = IndexMap::new();
-                    check.insert("attribut".into(), match attribute.clone() {
+                    check.insert(EvalKey("attribut".into()), match attribute.clone() {
                         Some(attr) => EvalValue::String(attr.clone()),
                         None => EvalValue::Null,
                     });
-                    check.insert("traits".into(), EvalValue::Array(traits.iter().cloned().map(|s| EvalValue::String(s.into())).collect()));
+                    check.insert(EvalKey("traits".into()), EvalValue::Array(traits.iter().cloned().map(|s| EvalValue::String(s.into())).collect()));
                     env.insert("test", EvalValue::Object(Arc::from(check)));
                 }
                 if let Some(filter) = filter {
@@ -434,32 +435,32 @@ impl Cell {
             EvalValue::Object(map) => map,
             _ => bail!("Une cellule doit être un objet"),
         };
-        let effects = PageEffect::parse_many_from_value(&data.get("effets").unwrap_or(&EvalValue::Null))
+        let effects = PageEffect::parse_many_from_value(&data.get(&EvalKey::from("effets")).unwrap_or(&EvalValue::Null))
             .with_context(|| "Erreur en parsant une cellule")?;
-        let trigger = match data.get("conditions") {
+        let trigger = match data.get(&EvalKey::from("conditions")) {
             None | Some(EvalValue::Null) => None,
             Some(EvalValue::Array(values)) if values.is_empty() => None,
             Some(EvalValue::Object(values)) if values.is_empty() => None,
             Some(value) => Some(Conditional::from_dict(&value)?),
             //_ => bail!("Le champ `conditions` d'une cellule doit être un tableau ou un objet"),
         };
-        let text = match data.get("texte") {
+        let text = match data.get(&EvalKey::from("texte")) {
             None | Some(EvalValue::Null) => None,
             Some(EvalValue::String(s)) => Some(EvalValue::String(s.clone())),
             Some(EvalValue::Func(f)) => Some(EvalValue::Func(f.clone())),
             _ => bail!("Le champ `texte` d'une cellule doit être une chaîne de caractères"),
         };
-        let id = match data.get("id") {
+        let id = match data.get(&EvalKey::from("id")) {
             None | Some(EvalValue::Null) => None,
             Some(EvalValue::String(s)) => Some(s.clone()),
             _ => bail!("Le champ `id` d'une cellule doit être une chaîne de caractères"),
         };
-        let label = match data.get("libelle") {
+        let label = match data.get(&EvalKey::from("libelle")) {
             None | Some(EvalValue::Null) => None,
             Some(EvalValue::String(s)) => Some(s.clone()),
             _ => bail!("Le champ `libelle` d'une cellule doit être une chaîne de caractères"),
         };
-        let images = match data.get("images") {
+        let images = match data.get(&EvalKey::from("images")) {
             None | Some(EvalValue::Null) => Vec::new(),
             Some(EvalValue::Array(arr)) => {
                 let mut def = Vec::new();
@@ -506,8 +507,8 @@ impl Cell {
     pub fn applies(
         &self,
         character: &Character,
-        page_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
-        connection_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
+        page_tags: Arc<IndexMap<EvalKey, EvalValue>>,
+        connection_tags: Arc<IndexMap<EvalKey, EvalValue>>,
         tale: &Tale,
         formula: &mut FormulaEngine,
     ) -> Result<bool> {
@@ -535,8 +536,8 @@ impl Cell {
     pub fn applies_with_env(
         &self,
         character: &Character,
-        page_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
-        connection_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
+        page_tags: Arc<IndexMap<EvalKey, EvalValue>>,
+        connection_tags: Arc<IndexMap<EvalKey, EvalValue>>,
         tale: &Tale,
         formula: &mut FormulaEngine,
         additional_env: &Env,
@@ -594,7 +595,7 @@ impl Cell {
 
         let mut results = Vec::new();
 
-        let denv = character.base_env(formula, &env)?.with_parent(&env);
+        let denv = mk_character_base_env(character, formula, &env)?.with_parent(&env);
         let effects = PageEffect::eval_many(&self.effects, formula, &denv)
             .with_context(|| "Erreur en évaluant les effets lors de l'application d'une cellule")?;
 
@@ -988,10 +989,10 @@ impl PageEffect {
                     path,
                     create_path,
                     value: value_or_formula(
-                        data.get("valeur")
+                        json_to_eval_value(&data.get("valeur")
                             .cloned()
                             .unwrap_or(JsonValue::Null)
-                            .try_into()?
+                        )?
                     )?,
                     selection: Selection::parse(data.get("selection"), "definir_tag")?,
                     notification,
@@ -1032,14 +1033,14 @@ impl PageEffect {
                     filter,
                     path,
                     create_path,
-                    amount: value_or_formula(value_or(data, "valeur", JsonValue::from(1)).try_into()?)?,
+                    amount: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(1)))?)?,
                     selection: Selection::parse(data.get("selection"), "incrementer_tag")?,
                     notification,
                 }
             },
             "ajouter_objet" => Self::AddItem {
                 item_id: value_or_formula(required_string(data, "objet", "AJOUTER_OBJET")?.into())?,
-                quantity: value_or_formula(value_or(data, "quantite", JsonValue::from(1)).try_into()?)?,
+                quantity: value_or_formula(json_to_eval_value(&value_or(data, "quantite", JsonValue::from(1)))?)?,
                 data: collect_data(data.get("donnees"))
                     .with_context(|| "Erreur en collectant les donnees de ajouter objet")?.into(),
                 notification,
@@ -1049,7 +1050,7 @@ impl PageEffect {
                     data.get("filtre")
                         .ok_or_else(|| anyhow!("RETIRER_OBJET doit inclure un filtre"))?,
                 )?,
-                quantity: value_or_formula(value_or(data, "quantite", JsonValue::from(1)).try_into()?)?,
+                quantity: value_or_formula(json_to_eval_value(&value_or(data, "quantite", JsonValue::from(1)))?)?,
                 selection: Selection::parse(data.get("selection"), "retirer_objet")?,
                 notification,
             },
@@ -1064,53 +1065,53 @@ impl PageEffect {
                 notification,
             },
             "modifier_pv" => Self::ModifyHp {
-                amount: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                amount: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 death: optional_string(data, "defaite")?.map(Arc::from).map(|s| split_fmt_str(&s))
                     .transpose()?,
                 notification,
             },
             "modifier_attribut" => Self::ModifyAttribute {
                 attribute: required_string(data, "attribut", "MODIFIER_ATTRIBUT")?.into(),
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 notification,
             },
             "definir_attribut" => Self::SetAttribute {
                 attribute: required_string(data, "attribut", "DEFINIR_ATTRIBUT")?.into(),
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 notification,
             },
             "definir_pv" => Self::SetHp {
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 death: optional_string(data, "defaite")?.map(Arc::from).map(|s| split_fmt_str(&s)).transpose()?,
                 notification,
             },
             "definir_pv_max" => Self::SetMaxHp {
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 death: optional_string(data, "defaite")?.map(Arc::from).map(|s| split_fmt_str(&s)).transpose()?,
                 notification,
             },
             "modifier_pv_max" => Self::ModifyMaxHp {
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 death: optional_string(data, "defaite")?.map(Arc::from).map(|s| split_fmt_str(&s)).transpose()?,
                 notification,
             },
             "definir_moral" => Self::SetMorale {
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 death: optional_string(data, "defaite")?.map(Arc::from).map(|s| split_fmt_str(&s)).transpose()?,
                 notification,
             },
             "definir_moral_max" => Self::SetMaxMorale {
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 death: optional_string(data, "defaite")?.map(Arc::from).map(|s| split_fmt_str(&s)).transpose()?,
                 notification,
             },
             "modifier_moral_max" => Self::ModifyMaxMorale {
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 death: optional_string(data, "defaite")?.map(Arc::from).map(|s| split_fmt_str(&s)).transpose()?,
                 notification,
             },
             "modifier_moral" => Self::ModifyMorale {
-                value: value_or_formula(value_or(data, "valeur", JsonValue::from(0)).try_into()?)?,
+                value: value_or_formula(json_to_eval_value(&value_or(data, "valeur", JsonValue::from(0)))?)?,
                 death: optional_string(data, "defaite")?.map(Arc::from).map(|s| split_fmt_str(&s)).transpose()?,
                 notification,
             },
@@ -1165,7 +1166,7 @@ impl PageEffect {
                             let label =
                                 required_string(choice_data, "texte", "Un choix de DEMANDER")?;
                             choices.push(PollChoice {
-                                value: value_or_formula(value.try_into()?)?,
+                                value: value_or_formula(json_to_eval_value(&value)?)?,
                                 label: split_fmt_str(&label)?,
                             });
                         }
@@ -1187,7 +1188,7 @@ impl PageEffect {
                 },
                 default: match data.get("defaut") {
                     None | Some(JsonValue::Null) => None,
-                    Some(value) => Some(value_or_formula(value.try_into()?)?),
+                    Some(value) => Some(value_or_formula(json_to_eval_value(&value)?)?),
                 },
                 notification,
             },
@@ -1212,11 +1213,11 @@ impl PageEffect {
             EvalValue::Object(map) => map,
             _ => bail!("Un effet de page doit être un objet"),
         };
-        let kind = match data.get("type") {
+        let kind = match data.get(&EvalKey::from("type")) {
             Some(EvalValue::String(s)) => s.as_ref(),
             _ => bail!("Un effet de page doit contenir un champ `type`"),
         };
-        let notification = match data.get("notification") {
+        let notification = match data.get(&EvalKey::from("notification")) {
             Some(EvalValue::String(s)) => Some(s.clone()),
             Some(EvalValue::Null) | None => None,
             _ => bail!("Le champ `notification` d'un effet de page doit être une chaîne ou null"),
@@ -1224,7 +1225,7 @@ impl PageEffect {
         let effect = match kind {
             "ajouter_etat" => Self::AddCondition {
                 condition_id: {
-                    let data = data.get("etat")
+                    let data = data.get(&EvalKey::from("etat"))
                         .ok_or_else(|| anyhow!("AJOUTER_ETAT doit inclure un champ `etat`"))?
                         .clone();
                     match data {
@@ -1233,7 +1234,7 @@ impl PageEffect {
                         _ => bail!("Le champ `etat` d'AJOUTER_ETAT doit être une chaîne ou une formule"),
                     }
                 },
-                data: match data.get("donnees") {
+                data: match data.get(&EvalKey::from("donnees")) {
                     Some(EvalValue::Object(obj)) => EvalValue::Object(obj.clone()),
                     Some(EvalValue::Null) | None => EvalValue::Object(IndexMap::new().into()),
                     Some(EvalValue::Func(f)) => EvalValue::Func(f.clone()),
@@ -1243,38 +1244,38 @@ impl PageEffect {
             },
             "retirer_etat" => Self::RemoveCondition {
                 filter: ConditionFilter::from_dict(
-                    data.get("filtre")
+                    data.get(&EvalKey::from("filtre"))
                         .ok_or_else(|| anyhow!("RETIRER_ETAT doit inclure un filtre"))?,
                 )?,
-                selection: Selection::parse_dict(data.get("selection"), "retirer_etat")?,
+                selection: Selection::parse_dict(data.get(&EvalKey::from("selection")), "retirer_etat")?,
                 notification,
             },
             "modifier_etat" => Self::ModifyCondition {
                 filter: ConditionFilter::from_dict(
-                    data.get("filtre")
+                    data.get(&EvalKey::from("filtre"))
                         .ok_or_else(|| anyhow!("MODIFIER_ETAT doit inclure un filtre"))?,
                 )?,
-                data: match data.get("donnees") {
+                data: match data.get(&EvalKey::from("donnees")) {
                     Some(EvalValue::Object(obj)) => EvalValue::Object(obj.clone()),
                     Some(EvalValue::Null) | None => EvalValue::Object(IndexMap::new().into()),
                     Some(EvalValue::Func(f)) => EvalValue::Func(f.clone()),
                     _ => bail!("Le champ `donnees` de MODIFIER_ETAT doit être un objet, une formule, ou null"),
                 },
-                selection: Selection::parse_dict(data.get("selection"), "modifier_etat")?,
+                selection: Selection::parse_dict(data.get(&EvalKey::from("selection")), "modifier_etat")?,
                 notification,
             },
             "definir_tag" => {
                 let filter = TagFilter::from_dict(
-                    data.get("filtre")
+                    data.get(&EvalKey::from("filtre"))
                         .ok_or_else(|| anyhow!("DEFINIR_TAG doit inclure un filtre"))?,
                 )?;
                 let targetted = if let TagFilter::Id(_) = filter { true } else { false };
-                let create_path = match data.get("creer_chemin") {
+                let create_path = match data.get(&EvalKey::from("creer_chemin")) {
                     Some(EvalValue::Bool(b)) => *b,
                     None => targetted,
                     other => bail!("DEFINIR_TAG: creer_chemin doit être un booléen, pas {other:?}")
                 };
-                let path = match data.get("chemin") {
+                let path = match data.get(&EvalKey::from("chemin")) {
                     Some(EvalValue::String(s)) if s.is_empty() => None,
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Array(arr)) => {
@@ -1294,25 +1295,25 @@ impl PageEffect {
                     filter,
                     path,
                     create_path,
-                    value: data.get("valeur")
+                    value: data.get(&EvalKey::from("valeur"))
                         .cloned()
                         .unwrap_or(EvalValue::Null),
-                    selection: Selection::parse_dict(data.get("selection"), "definir_tag")?,
+                    selection: Selection::parse_dict(data.get(&EvalKey::from("selection")), "definir_tag")?,
                     notification,
                 }
             },
             "incrementer_tag" => {
                 let filter = TagFilter::from_dict(
-                    data.get("filtre")
+                    data.get(&EvalKey::from("filtre"))
                         .ok_or_else(|| anyhow!("INCREMENTER_TAG doit inclure un filtre"))?,
                 )?;
                 let targetted = if let TagFilter::Id(_) = filter { true } else { false };
-                let create_path = match data.get("creer_chemin") {
+                let create_path = match data.get(&EvalKey::from("creer_chemin")) {
                     Some(EvalValue::Bool(b)) => *b,
                     None => targetted,
                     other => bail!("INCREMENTER_TAG: creer_chemin doit être un booléen, pas {other:?}")
                 };
-                let path = match data.get("chemin") {
+                let path = match data.get(&EvalKey::from("chemin")) {
                     Some(EvalValue::String(s)) if s.is_empty() => None,
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Array(arr)) => {
@@ -1332,26 +1333,26 @@ impl PageEffect {
                     filter,
                     path,
                     create_path,
-                    amount: data.get("valeur")
+                    amount: data.get(&EvalKey::from("valeur"))
                         .cloned()
                         .unwrap_or(EvalValue::Int(1)),
-                    selection: Selection::parse_dict(data.get("selection"), "incrementer_tag")?,
+                    selection: Selection::parse_dict(data.get(&EvalKey::from("selection")), "incrementer_tag")?,
                     notification,
                 }
             },
             "ajouter_objet" => Self::AddItem {
                 item_id:  {
-                    let data = data.get("objet").cloned();
+                    let data = data.get(&EvalKey::from("objet")).cloned();
                     match data {
                         Some(EvalValue::String(_)) => data.unwrap(),
                         Some(EvalValue::Func(_)) => data.unwrap(),
                         _ => bail!("Le champ `objet` d'AJOUTER_OBJET doit être une chaîne ou une formule"),
                     }
                 },
-                quantity: data.get("quantite")
+                quantity: data.get(&EvalKey::from("quantite"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(1)),
-                data: match data.get("donnees") {
+                data: match data.get(&EvalKey::from("donnees")) {
                     Some(EvalValue::Object(obj)) => EvalValue::Object(obj.clone()),
                     Some(EvalValue::Null) | None => EvalValue::Object(IndexMap::new().into()),
                     Some(EvalValue::Func(f)) => EvalValue::Func(f.clone()),
@@ -1361,34 +1362,34 @@ impl PageEffect {
             },
             "retirer_objet" => Self::RemoveItem {
                 filter: ItemFilter::from_dict(
-                    data.get("filtre")
+                    data.get(&EvalKey::from("filtre"))
                         .ok_or_else(|| anyhow!("RETIRER_OBJET doit inclure un filtre"))?,
                 )?,
-                quantity: data.get("quantite")
+                quantity: data.get(&EvalKey::from("quantite"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(1)),
-                selection: Selection::parse_dict(data.get("selection"), "retirer_objet")?,
+                selection: Selection::parse_dict(data.get(&EvalKey::from("selection")), "retirer_objet")?,
                 notification,
             },
             "modifier_objet" => Self::ModifyItem {
                 filter: ItemFilter::from_dict(
-                    data.get("filtre")
+                    data.get(&EvalKey::from("filtre"))
                         .ok_or_else(|| anyhow!("MODIFIER_OBJET doit inclure un filtre"))?,
                 )?,
-                data: match data.get("donnees") {
+                data: match data.get(&EvalKey::from("donnees")) {
                     Some(EvalValue::Object(obj)) => EvalValue::Object(obj.clone()),
                     Some(EvalValue::Null) | None => EvalValue::Object(IndexMap::new().into()),
                     Some(EvalValue::Func(f)) => EvalValue::Func(f.clone()),
                     _ => bail!("Le champ `donnees` de MODIFIER_OBJET doit être un objet, une formule, ou null"),
                 },
-                selection: Selection::parse_dict(data.get("selection"), "modifier_objet")?,
+                selection: Selection::parse_dict(data.get(&EvalKey::from("selection")), "modifier_objet")?,
                 notification,
             },
             "modifier_pv" => Self::ModifyHp {
-                amount: data.get("valeur")
+                amount: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
-                death: match data.get("defaite") {
+                death: match data.get(&EvalKey::from("defaite")) {
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Null) | None => None,
                     _ => bail!("Le champ `defaite` d'un effet MODIFIER_PV doit être une chaîne ou null"),
@@ -1396,30 +1397,30 @@ impl PageEffect {
                 notification,
             },
             "modifier_attribut" => Self::ModifyAttribute {
-                attribute: match data.get("attribut") {
+                attribute: match data.get(&EvalKey::from("attribut")) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("MODIFIER_ATTRIBUT doit inclure un champ `attribut`"),
                 },
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
                 notification,
             },
             "definir_attribut" => Self::SetAttribute {
-                attribute: match data.get("attribut") {
+                attribute: match data.get(&EvalKey::from("attribut")) {
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("DEFINIR_ATTRIBUT doit inclure un champ `attribut`"),
                 },
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
                 notification,
             },
             "definir_pv" => Self::SetHp {
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
-                death: match data.get("defaite") {
+                death: match data.get(&EvalKey::from("defaite")) {
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Null) | None => None,
                     _ => bail!("Le champ `defaite` d'un effet DEFINIR_PV doit être une chaîne ou null"),
@@ -1427,10 +1428,10 @@ impl PageEffect {
                 notification,
             },
             "definir_pv_max" => Self::SetMaxHp {
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
-                death: match data.get("defaite") {
+                death: match data.get(&EvalKey::from("defaite")) {
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Null) | None => None,
                     _ => bail!("Le champ `defaite` d'un effet DEFINIR_PV_MAX doit être une chaîne ou null"),
@@ -1438,10 +1439,10 @@ impl PageEffect {
                 notification,
             },
             "modifier_pv_max" => Self::ModifyMaxHp {
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
-                death: match data.get("defaite") {
+                death: match data.get(&EvalKey::from("defaite")) {
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Null) | None => None,
                     _ => bail!("Le champ `defaite` d'un effet MODIFIER_PV_MAX doit être une chaîne ou null"),
@@ -1449,10 +1450,10 @@ impl PageEffect {
                 notification,
             },
             "definir_moral" => Self::SetMorale {
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
-                death: match data.get("defaite") {
+                death: match data.get(&EvalKey::from("defaite")) {
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Null) | None => None,
                     _ => bail!("Le champ `defaite` d'un effet DEFINIR_MORAL doit être une chaîne ou null"),
@@ -1460,10 +1461,10 @@ impl PageEffect {
                 notification,
             },
             "definir_moral_max" => Self::SetMaxMorale {
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
-                death: match data.get("defaite") {
+                death: match data.get(&EvalKey::from("defaite")) {
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Null) | None => None,
                     _ => bail!("Le champ `defaite` d'un effet DEFINIR_MORAL_MAX doit être une chaîne ou null"),
@@ -1471,10 +1472,10 @@ impl PageEffect {
                 notification,
             },
             "modifier_moral_max" => Self::ModifyMaxMorale {
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
-                death: match data.get("defaite") {
+                death: match data.get(&EvalKey::from("defaite")) {
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Null) | None => None,
                     _ => bail!("Le champ `defaite` d'un effet MODIFIER_MORAL_MAX doit être une chaîne ou null"),
@@ -1482,10 +1483,10 @@ impl PageEffect {
                 notification,
             },
             "modifier_moral" => Self::ModifyMorale {
-                value: data.get("valeur")
+                value: data.get(&EvalKey::from("valeur"))
                     .cloned()
                     .unwrap_or(EvalValue::Int(0)),
-                death: match data.get("defaite") {
+                death: match data.get(&EvalKey::from("defaite")) {
                     Some(EvalValue::String(s)) => Some(s.clone()),
                     Some(EvalValue::Null) | None => None,
                     _ => bail!("Le champ `defaite` d'un effet MODIFIER_MORAL doit être une chaîne ou null"),
@@ -1493,7 +1494,7 @@ impl PageEffect {
                 notification,
             },
             "modifier_nom" => Self::ModifyName {
-                value: match data.get("valeur") {
+                value: match data.get(&EvalKey::from("valeur")) {
                     Some(EvalValue::String(s)) => split_fmt_str(&s)?,
                     _ => bail!("MODIFIER_NOM doit inclure un champ `valeur`"),
                 },
@@ -1501,10 +1502,10 @@ impl PageEffect {
             },
             "retirer_tag" => Self::RemoveTag {
                 filter: TagFilter::from_dict(
-                    data.get("filtre")
+                    data.get(&EvalKey::from("filtre"))
                         .ok_or_else(|| anyhow!("RETIRER_TAG doit inclure un filtre"))?,
                 )?,
-                path: match data.get("chemin") {
+                path: match data.get(&EvalKey::from("chemin")) {
                     Some(EvalValue::String(s)) if s.is_empty() => Some("".into()),
                     Some(EvalValue::String(s)) => Some(split_fmt_str(&s)?),
                     Some(EvalValue::Array(arr)) => {
@@ -1520,21 +1521,21 @@ impl PageEffect {
                     None | Some(EvalValue::Null) => None,
                     other => bail!("RETIRER_TAG: chemin doit être une chaîne ou un tableau de chaînes, pas {other:?}"),
                 },
-                selection: Selection::parse_dict(data.get("selection"), "retirer_tag")?,
+                selection: Selection::parse_dict(data.get(&EvalKey::from("selection")), "retirer_tag")?,
                 notification,
             },
             "demander" => Self::Poll {
-                destination: match data.get("tag") {
+                destination: match data.get(&EvalKey::from("tag")) {
                     Some(EvalValue::String(s)) => split_fmt_str(&s)?,
                     _ => bail!("DEMANDER doit inclure un champ `tag`"),
                 },
-                prompt: match data.get("question") {
+                prompt: match data.get(&EvalKey::from("question")) {
                     Some(EvalValue::String(s)) => split_fmt_str(&s)?,
                     _ => bail!("DEMANDER doit inclure un champ `question`"),
                 },
                 data_type: {
                     let type_str = data
-                        .get("donnees")
+                        .get(&EvalKey::from("donnees"))
                         .and_then(|v| match v {
                             EvalValue::String(s) => Some(s.as_ref()),
                             _ => None,
@@ -1543,7 +1544,7 @@ impl PageEffect {
                     PollRequestDataType::from_str(type_str)?
                 },
                 choices: {
-                    let choices_source = data.get("choix").and_then(|v| match v {
+                    let choices_source = data.get(&EvalKey::from("choix")).and_then(|v| match v {
                         EvalValue::Array(_) => Some(v.clone()),
                         EvalValue::Func(_) => Some(v.clone()),
                         _ => None,
@@ -1556,11 +1557,11 @@ impl PageEffect {
                                     EvalValue::Object(map) => map,
                                     _ => bail!("Un choix de DEMANDER doit être un objet"),
                                 };
-                                let value = match choice_data.get("valeur") {
+                                let value = match choice_data.get(&EvalKey::from("valeur")) {
                                     Some(v) => v.clone(),
                                     None => bail!("Un choix de DEMANDER doit inclure un champ `valeur`"),
                                 };
-                                let label = match choice_data.get("texte") {
+                                let label = match choice_data.get(&EvalKey::from("texte")) {
                                     Some(EvalValue::String(s)) => split_fmt_str(&s)?,
                                     _ => bail!("Un choix de DEMANDER doit inclure un champ `texte`"),
                                 };
@@ -1581,14 +1582,14 @@ impl PageEffect {
                         None
                     }
                 },
-                default: match data.get("defaut") {
+                default: match data.get(&EvalKey::from("defaut")) {
                     None | Some(EvalValue::Null) => None,
                     Some(value) => Some(value.clone()),
                 },
                 notification,
             },
             "rediriger" => {
-                let destination = match data.get("destination") {
+                let destination = match data.get(&EvalKey::from("destination")) {
                     Some(EvalValue::String(s)) if s.is_empty() => bail!("REDIRIGER doit inclure un champ `destination` non vide"),
                     Some(EvalValue::String(s)) => s.clone(),
                     _ => bail!("REDIRIGER doit inclure un champ `destination`"),
@@ -1643,10 +1644,10 @@ impl PageEffect {
                                     .map(|choice| {
                                         match choice {
                                             EvalValue::Object(data) => {
-                                                let Some(value) = data.get("valeur").cloned() else {
+                                                let Some(value) = data.get(&EvalKey("valeur".into())).cloned() else {
                                                     bail!("Un choix de DEMANDER doit inclure un champ `valeur`")
                                                 };
-                                                let Some(EvalValue::String(label)) = data.get("texte").cloned() else {
+                                                let Some(EvalValue::String(label)) = data.get(&EvalKey("texte".into())).cloned() else {
                                                     bail!("Un choix de DEMANDER doit inclure un champ `texte`")
                                                 };
                                                 Ok(PollChoice {
@@ -1751,14 +1752,14 @@ impl PageEffect {
         character: &mut Character,
         tale: &Tale,
         formula: &mut FormulaEngine,
-        env: &Env,
+        oenv: &Env,
         term: &Terminal,
         interaction: &mut Interaction,
     ) -> Result<PageEffectResult> {
         let result = (|| {
             match self {
             Self::AddCondition { condition_id, data, notification } => {
-                let condition_id = match formula.resolve_formula(condition_id, env)? {
+                let condition_id = match formula.resolve_formula(condition_id, oenv)? {
                     EvalValue::String(s) => s,
                     other => bail!("AJOUTER_ETAT: l'identifiant de l'état doit se résoudre à une chaîne, pas {other}"),
                 };
@@ -1766,15 +1767,17 @@ impl PageEffect {
                     .conditions
                     .get(&condition_id)
                     .ok_or_else(|| anyhow!("État '{condition_id}' introuvable"))?;
-                let base_env = character.base_env(formula, env)?.with_parent(env);
+                let base_env = mk_character_base_env(character, formula, oenv)?.with_parent(oenv);
                 let condition = template.instantiate(data, formula, &base_env)?;
                 let actual_name = condition.actual_name(formula, &base_env)?;
-                let notice_env = condition_notification_env(&condition, formula, &base_env)?;
                 let death = condition.template.death.clone();
                 character.conditions.push(condition);
-                character.fix_hp(formula, env)?;
-                character.fix_morale(formula, env)?;
-                let notice_env = character.base_env(formula, env)?.expand(notice_env);
+                let idx = character.conditions.len() - 1;
+                character.fix_hp(formula, oenv)?;
+                character.fix_morale(formula, oenv)?;
+                let charenv = mk_character_base_env(character, formula, oenv)?;
+                let notice_env = condition_notification_env(&charenv, idx, &base_env)?;
+                let notice_env = charenv.expand(notice_env);
                 let notif = notification
                     .as_ref()
                     .map(|n| formula.fmt_value(n, &notice_env))
@@ -1797,14 +1800,14 @@ impl PageEffect {
                 })
             }
             Self::RemoveCondition { filter, selection , notification} => {
-                self.remove_conditions(character, filter, *selection, notification.as_ref(), formula, &env)
+                self.remove_conditions(character, filter, *selection, notification.as_ref(), formula, &oenv)
             }
             Self::ModifyCondition {
                 filter,
                 data,
                 selection,
                 notification,
-            } => self.modify_conditions(character, filter, data.clone(), *selection, notification.as_ref(), formula, &env),
+            } => self.modify_conditions(character, filter, data.clone(), *selection, notification.as_ref(), formula, &oenv),
             Self::SetTag {
                 filter,
                 path,
@@ -1821,7 +1824,7 @@ impl PageEffect {
                 *selection,
                 notification.as_ref(),
                 formula,
-                env,
+                oenv,
             ),
             Self::IncrementTag {
                 filter,
@@ -1839,7 +1842,7 @@ impl PageEffect {
                 *selection,
                 notification.as_ref(),
                 formula,
-                env,
+                oenv,
             ),
             Self::AddItem {
                 item_id,
@@ -1847,7 +1850,7 @@ impl PageEffect {
                 data,
                 notification,
             } => {
-                let item_id = match formula.resolve_formula(item_id, env)? {
+                let item_id = match formula.resolve_formula(item_id, oenv)? {
                     EvalValue::String(s) => s,
                     other => bail!("AJOUTER_OBJET: l'identifiant de l'objet doit se résoudre à une chaîne, pas {other}"),
                 };
@@ -1856,22 +1859,23 @@ impl PageEffect {
                     .get(&item_id)
                     .cloned()
                     .ok_or_else(|| anyhow!("Objet '{item_id}' introuvable"))?;
-                let charenv = character.env(formula, env)?;
-                let env = charenv.merged(&env);
-                let quantity = formula.resolve_formula_quantity(quantity, &env)?;
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let env = charenv.merged(&oenv);
+                let quantity = resolve_formula_quantity(quantity, formula, &env)?;
                 if quantity <= 0 {
                     return Ok(PageEffectResult::default());
                 }
                 // add the default data to the stack if it is absent
                 let stack = item.instantiate(&data, quantity, formula, &env)?;
-                let env = stack.env(formula, &env)
+                let idx = character.add_item(stack.clone());
+                let env = mk_partial_item_env(&stack)
                     .with_context(|| "Erreur en construisant l'environement d'objet dans effet 'ajouter objet'")?
                     .with_parent(&env);
                 let name = stack.actual_name(formula, &env)?;
-                let notice_env = item_notification_env(&stack, formula, &env)?
-                    .expand(character.base_env(formula, &env)?)
+                let charenv = mk_character_env(character, formula, &env)?;
+                let notice_env = mk_item_env(&charenv, idx)?
+                    .expand(charenv)
                     .with_parent(&env);
-                character.add_item(stack);
                 let quantity_text = if quantity > 1 {
                     format!(" x{quantity}")
                 } else {
@@ -1898,19 +1902,19 @@ impl PageEffect {
                 quantity,
                 selection,
                 notification,
-            } => self.remove_items(character, filter, quantity, *selection, notification.as_ref(), formula, &env),
+            } => self.remove_items(character, filter, quantity, *selection, notification.as_ref(), formula, &oenv),
             Self::ModifyItem {
                 filter,
                 data,
                 selection,
                 notification,
-            } => self.modify_items(character, filter, data.clone(), *selection, notification.as_ref(), formula, &env),
+            } => self.modify_items(character, filter, data.clone(), *selection, notification.as_ref(), formula, &oenv),
             Self::ModifyHp { amount, death, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(amount, &base_env)?;
                 let old_value = character.hp;
-                if !character.modify_hp(amount, formula, env)? && death.is_some() {
+                if !character.modify_hp(amount, formula, oenv)? && death.is_some() {
                     return Ok(PageEffectResult {
                         next_page: {
                             let mut env = Env::new().with_parent(&base_env);
@@ -1928,7 +1932,7 @@ impl PageEffect {
                     character.hp.into(), 
                     &|| signed(amount, "PV"), 
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -1937,8 +1941,8 @@ impl PageEffect {
             }
             Self::ModifyAttribute { attribute, value, notification } => {
                 character.ensure_attribute(attribute)?;
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let old_value = character.attributes.get(attribute).cloned().unwrap_or(0);
                 *character.attributes.get_mut(attribute).expect("vérifié") += amount;
@@ -1947,8 +1951,8 @@ impl PageEffect {
                 nenv.insert("attribut", EvalValue::String(attribute.clone()));
                 nenv.insert("ancienne", EvalValue::Int(old_value));
                 nenv.insert("valeur", EvalValue::Int(new_value));
-                let charenv = character.env(formula, env)?;
-                let nenv = nenv.with_parent(env).with_parent(&charenv);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let nenv = nenv.with_parent(oenv).with_parent(&charenv);
                 let notif = notification
                     .as_ref()
                     .map(|n| formula.fmt_value(n, &nenv))
@@ -1966,8 +1970,8 @@ impl PageEffect {
             }
             Self::SetAttribute { attribute, value , notification} => {
                 character.ensure_attribute(attribute)?;
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let ancienne = character.attributes.get(attribute).cloned().unwrap_or(0);
                 character.attributes.insert(attribute.clone(), amount);
@@ -1975,8 +1979,8 @@ impl PageEffect {
                 nenv.insert("attribut", EvalValue::String(attribute.clone()));
                 nenv.insert("ancienne", EvalValue::Int(ancienne));
                 nenv.insert("valeur", EvalValue::Int(amount));
-                let charenv = character.env(formula, env)?;
-                let nenv = nenv.with_parent(env).with_parent(&charenv);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let nenv = nenv.with_parent(oenv).with_parent(&charenv);
                 let notif = notification
                     .as_ref()
                     .map(|n| formula.fmt_value(n, &nenv))
@@ -1993,11 +1997,11 @@ impl PageEffect {
                 })
             }
             Self::SetHp { value, death, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let old_value = character.hp;
-                if !character.set_hp(amount, formula, env)? && death.is_some() {
+                if !character.set_hp(amount, formula, oenv)? && death.is_some() {
                     return Ok(PageEffectResult {
                         next_page: {
                             let mut env = Env::new().with_parent(&base_env);
@@ -2015,7 +2019,7 @@ impl PageEffect {
                     character.hp.into(), 
                     &|| format!("PV défini à {}", character.hp).into(), 
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -2023,12 +2027,12 @@ impl PageEffect {
                 })
             }
             Self::SetMaxHp { value, death, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let old_value = character.max_hp;
-                character.set_max_hp(amount, formula, env)?;
-                character.fix_hp(formula, env)?;
+                character.set_max_hp(amount, formula, oenv)?;
+                character.fix_hp(formula, oenv)?;
                 if !character.is_alive() {
                     return Ok(PageEffectResult {
                         next_page: {
@@ -2047,7 +2051,7 @@ impl PageEffect {
                     character.max_hp.into(), 
                     &|| format!("PV Max défini à {}", character.max_hp).into(), 
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -2055,12 +2059,12 @@ impl PageEffect {
                 })
             }
             Self::ModifyMaxHp { value, death, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let old_value = character.max_hp;
-                character.modify_max_hp(amount, formula, env)?;
-                character.fix_hp(formula, env)?;
+                character.modify_max_hp(amount, formula, oenv)?;
+                character.fix_hp(formula, oenv)?;
                 if !character.is_alive() {
                     return Ok(PageEffectResult {
                         next_page: {
@@ -2079,7 +2083,7 @@ impl PageEffect {
                     character.max_hp.into(), 
                     &|| signed(amount, "Max PV"), 
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -2087,11 +2091,11 @@ impl PageEffect {
                 })
             }
             Self::SetMorale { value, death, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let old_value = character.morale;
-                if !character.set_morale(amount, formula, env)? && death.is_some() {
+                if !character.set_morale(amount, formula, oenv)? && death.is_some() {
                     return Ok(PageEffectResult {
                         next_page: {
                             let mut env = Env::new().with_parent(&base_env);
@@ -2109,7 +2113,7 @@ impl PageEffect {
                     character.morale.into(), 
                     &|| format!("Moral défini à {}", character.morale).into(), 
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -2117,12 +2121,12 @@ impl PageEffect {
                 })
             }
             Self::SetMaxMorale { value, death, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let old_value = character.max_morale;
-                character.set_max_morale(amount, formula, env)?;
-                character.fix_morale(formula, env)?;
+                character.set_max_morale(amount, formula, oenv)?;
+                character.fix_morale(formula, oenv)?;
                 if !character.is_alive() {
                     return Ok(PageEffectResult {
                         next_page: {
@@ -2141,7 +2145,7 @@ impl PageEffect {
                     character.max_morale.into(), 
                     &|| format!("Moral Max défini à {}", character.max_morale).into(), 
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -2149,12 +2153,12 @@ impl PageEffect {
                 })
             }
             Self::ModifyMaxMorale { value, death, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let old_value = character.max_morale;
-                character.modify_max_morale(amount, formula, env)?;
-                character.fix_morale(formula, env)?;
+                character.modify_max_morale(amount, formula, oenv)?;
+                character.fix_morale(formula, oenv)?;
                 if !character.is_alive() {
                     return Ok(PageEffectResult {
                         next_page: {
@@ -2173,7 +2177,7 @@ impl PageEffect {
                     character.max_morale.into(), 
                     &|| signed(amount, "Moral Max"), 
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -2181,11 +2185,11 @@ impl PageEffect {
                 })
             }
             Self::ModifyMorale { value, death, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let amount = formula.resolve_formula_int(value, &base_env)?;
                 let old_value = character.morale;
-                if !character.modify_morale(amount, formula, env)? && death.is_some() {
+                if !character.modify_morale(amount, formula, oenv)? && death.is_some() {
                     return Ok(PageEffectResult {
                         next_page: {
                             let mut env = Env::new().with_parent(&base_env);
@@ -2203,7 +2207,7 @@ impl PageEffect {
                     character.morale.into(), 
                     &|| signed(amount, "Moral"), 
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -2211,8 +2215,8 @@ impl PageEffect {
                 })
             }
             Self::ModifyName { value, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let new_name = formula.fmt_value(value, &base_env)?;
                 let old_name = character.name.clone().unwrap_or_else(|| "Inconnu".into());
                 character.name = Some(new_name.clone());
@@ -2223,7 +2227,7 @@ impl PageEffect {
                     new_name.clone().into(), 
                     &|| format!("Ton nom est maintenant: {}", new_name).into(),
                     formula, 
-                    &env
+                    &oenv
                 )?;
                 Ok(PageEffectResult {
                     shows: notifs.into(),
@@ -2238,12 +2242,12 @@ impl PageEffect {
                     *selection, 
                     notification.as_ref(),
                     formula, 
-                    env
+                    oenv
                 )
             }
             Self::Poll { notification, .. } => {
-                let charenv = character.base_env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 if let Some((destination, prompt, request)) = self.poll(formula, &base_env)? {
                     let (res, text) = interaction.poll(term, request)?;
                     let msg = format!("{} > {}", prompt, text);
@@ -2252,7 +2256,7 @@ impl PageEffect {
                     let old_value = tag.clone();
                     *tag = res.clone();
                     if let Some(notif) = notification {
-                        let mut nenv = character.base_env(formula, env)?.with_parent(env);
+                        let mut nenv = mk_character_env(character, formula, oenv)?.with_parent(&oenv);
                         nenv.insert("tag", EvalValue::String(destination.clone()));
                         nenv.insert("valeur", res.clone());
                         nenv.insert("ancienne", old_value);
@@ -2275,8 +2279,8 @@ impl PageEffect {
                 }
             },
             Self::Redirection { destination: page_id, notification } => {
-                let charenv = character.env(formula, env)?;
-                let base_env = charenv.merged(&env);
+                let charenv = mk_character_env(character, formula, oenv)?;
+                let base_env = charenv.merged(&oenv);
                 let page_id = formula.fmt_value(page_id, &base_env)?;
                 let notif = notification
                     .as_ref()
@@ -2314,7 +2318,7 @@ impl PageEffect {
         formula: &mut FormulaEngine,
         env: &Env,
     ) -> Result<PageEffectResult> {
-        let base_env = character.base_env(formula, env)?.with_parent(env);
+        let base_env = mk_character_base_env(character, formula, env)?.with_parent(env);
         let mut indices = Vec::new();
         for (index, condition) in character.conditions.iter().enumerate() {
             if filter.matches(condition, formula, &base_env)? {
@@ -2331,8 +2335,10 @@ impl PageEffect {
             let name = condition.actual_name(formula, &base_env)?;
             character.fix_hp(formula, &env)?;
             character.fix_morale(formula, &env)?;
-            let nenv = character.base_env(formula, &env)?
-                .expand(condition_notification_env(&condition, formula, &base_env)?);
+            let charenv = mk_character_env(character, formula, &env)?;
+            let nenv = condition_notification_env(&charenv, index, &base_env)?;
+            let nenv = charenv
+                .expand(nenv);
             let notif = notification
                 .as_ref()
                 .map(|n| formula.fmt_value(n, &nenv))
@@ -2376,7 +2382,7 @@ impl PageEffect {
             EvalValue::Object(map) => map.clone(),
             other => bail!("Les données d'état doivent être un dictionnaire ou être évalué en un, reçu {other}"),
         };
-        let base_env = character.base_env(formula, env)?.with_parent(env);
+        let base_env = mk_character_base_env(character, formula, env)?.with_parent(env);
         let mut indices = Vec::new();
         for (index, condition) in character.conditions.iter().enumerate() {
             if filter.matches(condition, formula, &base_env)? {
@@ -2389,9 +2395,9 @@ impl PageEffect {
         let mut notifs = Vec::new();
         for index in indices {
             let old_metadata = EvalValue::Object(character.conditions[index].data.clone());
-            let env = character.conditions[index].env(formula, &base_env)
+            let env = mk_partial_condition_env(&character.conditions[index])
                 .with_context(|| "Erreur en construisant l'environement d'objet dans l'effet 'modifier etat'")?
-                .expand(character.base_env(formula, env)?).with_parent(env);
+                .expand(mk_character_base_env(character, formula, env)?).with_parent(env);
             let new_data = resolve_map(updates.clone(), &env, formula)?;
             {
                 let condition = &mut character.conditions[index];
@@ -2405,8 +2411,9 @@ impl PageEffect {
             let name = character.conditions[index].actual_name(formula, &base_env)?;
             let mut nenv = Env::new();
             nenv.insert("ancienne", old_metadata);
-            let nenv = condition_notification_env(&character.conditions[index], formula, &base_env)?
-                .expand(character.base_env(formula, &env)?)
+            let charenv = mk_character_env(character, formula, &env)?;
+            let nenv = condition_notification_env(&charenv, index, &base_env)?
+                .expand(charenv)
                 .with_parent(&nenv);
             let notif = notification
                 .as_ref()
@@ -2445,12 +2452,12 @@ impl PageEffect {
         selection: Selection,
         notification: Option<&EvalValue>,
         formula: &mut FormulaEngine,
-        env: &Env,
+        oenv: &Env,
     ) -> Result<PageEffectResult> {
-        let base_env = character.base_env(formula, env)?.with_parent(env);
+        let base_env = mk_character_base_env(character, formula, oenv)?.with_parent(oenv);
         let mut indices = Vec::new();
         for (index, stack) in character.inventory.iter().enumerate() {
-            let env = stack.env(formula, &base_env)
+            let env = mk_partial_item_env(&stack)
                 .with_context(|| "Erreur en construisant l'environement d'objet dans effet 'retirer objet'")?
                 .with_parent(&base_env);
             if filter.matches(stack, formula, &env)? {
@@ -2461,25 +2468,30 @@ impl PageEffect {
         //let base_env = env.merged(&character.env());
         let mut notifs = Vec::new();
         for index in indices {
-            let stack = &mut character.inventory[index];
-            let env = stack.env(formula, &base_env)
-                .with_context(|| "Erreur en construisant l'environement d'objet dans effet 'retirer objet'")?
-                .with_parent(&base_env);
-            let quantity = formula.resolve_formula_quantity(quantity, &env)?;
-            let old_value = stack.quantity;
-            let removed = quantity.min(stack.quantity);
-            let name = stack.actual_name(formula, &base_env)?;
-            let suffix = if removed > 1 {
-                format!(" x{removed}")
-            } else {
-                String::new()
+            let (old_value, stack_qt, removed, name, suffix) = {
+                let stack = &mut character.inventory[index];
+                let env = mk_partial_item_env(&stack)
+                    .with_context(|| "Erreur en construisant l'environement d'objet dans effet 'retirer objet'")?
+                    .with_parent(&base_env);
+                let quantity = resolve_formula_quantity(quantity, formula, &env)?;
+                let old_value = stack.quantity;
+                let removed = quantity.min(stack.quantity);
+                let name = stack.actual_name(formula, &base_env)?;
+                let suffix = if removed > 1 {
+                    format!(" x{removed}")
+                } else {
+                    String::new()
+                };
+                let mut removed_stack = stack.clone();
+                removed_stack.quantity = removed;
+                stack.quantity -= removed;
+                (old_value, stack.quantity, removed, name, suffix)
             };
-            let mut removed_stack = stack.clone();
-            removed_stack.quantity = removed;
-            stack.quantity -= removed;
-            let mut nenv = item_notification_env(&removed_stack, formula, &base_env)?;
+            let charenv = mk_character_base_env(character, formula, oenv)?;
+            let nenv = item_notification_env(&charenv, index, &base_env)?;
+            let mut nenv = charenv.expand(nenv);
             nenv.insert("ancienne", EvalValue::Int(old_value));
-            nenv.insert("valeur", EvalValue::Int(stack.quantity));
+            nenv.insert("valeur", EvalValue::Int(stack_qt));
             nenv.insert("retires", EvalValue::Int(removed));
             let notif = notification
                 .as_ref()
@@ -2511,16 +2523,16 @@ impl PageEffect {
         selection: Selection,
         notification: Option<&EvalValue>,
         formula: &mut FormulaEngine,
-        env: &Env,
+        oenv: &Env,
     ) -> Result<PageEffectResult> {
-        let updates = match formula.resolve_formula(&updates, env)? {
+        let updates = match formula.resolve_formula(&updates, oenv)? {
             EvalValue::Object(map) => map.clone(),
             other => bail!("Les données d'état doivent être un dictionnaire ou être évalué en un, reçu {other}"),
         };
-        let base_env = character.base_env(formula, env)?.with_parent(env);
+        let base_env = mk_character_base_env(character, formula, oenv)?.with_parent(oenv);
         let mut indices = Vec::new();
         for (index, stack) in character.inventory.iter().enumerate() {
-            let env = stack.env(formula, &base_env)
+            let env = mk_partial_item_env(&stack)
                 .with_context(|| "Erreur en construisant l'environement d'objet dans effet 'modifier objet'")?
                 .with_parent(&base_env);
             if filter.matches(stack, formula, &env)? {
@@ -2532,8 +2544,8 @@ impl PageEffect {
         let mut notifs = Vec::new();
         for index in indices {
             let old_metadata = EvalValue::Object(character.inventory[index].data.clone());
-            let env = character.base_env(formula, env)?.with_parent(env);
-            let ienv = character.inventory[index].env(formula, &env)
+            let env = mk_character_base_env(character, formula, oenv)?.with_parent(oenv);
+            let ienv = mk_partial_item_env(&character.inventory[index])
                 .with_context(|| "Erreur en évaluant l'environement d'objet pour l'effet 'modifier objet'")?;
             let env = env.expand(ienv);
             let new_data = resolve_map(updates.clone(), &env, formula)?;
@@ -2544,7 +2556,9 @@ impl PageEffect {
             let name = character.inventory[index].actual_name(formula, &base_env)?;
             let mut nenv = Env::new();
             nenv.insert("ancienne", old_metadata);
-            let nenv = character.base_env(formula, &env)?.expand(item_notification_env(&character.inventory[index], formula, &base_env)?)
+            let charenv = mk_character_base_env(character, formula, oenv)?;
+            let inenv = item_notification_env(&charenv, index, &base_env)?;
+            let nenv = charenv.expand(inenv)
                 .with_parent(&nenv);
             let notif = notification
                 .as_ref()
@@ -2568,10 +2582,10 @@ impl PageEffect {
 /// Evaluates deferred formulas exactly once against the supplied environment and returns
 /// the resolved value without recursively evaluating strings produced by that formula.
 fn resolve_map(
-    values: Arc<IndexMap<Arc<str>, EvalValue>>,
+    values: Arc<IndexMap<EvalKey, EvalValue>>,
     env: &Env,
     formula: &mut FormulaEngine,
-) -> Result<IndexMap<Arc<str>, EvalValue>> {
+) -> Result<IndexMap<EvalKey, EvalValue>> {
     values
         .iter()
         .map(|(key, value)| Ok((key.clone(), formula.resolve_formula(value, env)?)))
@@ -2652,7 +2666,7 @@ fn nested_tag_value(
         return Ok(Some(current.clone()));
     };
     match (current, segment) {
-        (EvalValue::Object(values), TagPathSegment::Key(key)) => match values.get(key) {
+        (EvalValue::Object(values), TagPathSegment::Key(key)) => match values.get(&EvalKey(key.clone().into())) {
             Some(value) => nested_tag_value(value, remaining, create_path),
             None if remaining.is_empty() || create_path => Ok(None),
             None => bail!("La clé intermédiaire `{key}` du chemin n'existe pas"),
@@ -2703,17 +2717,18 @@ fn write_nested_tag_value(
         (EvalValue::Object(values), TagPathSegment::Key(key)) => {
             let work = Arc::make_mut(values);
             if remaining.is_empty() {
-                work.insert(key.clone(), value);
+                work.insert(EvalKey(key.clone().into()), value);
                 return Ok(());
             }
-            if !work.contains_key(key) {
+            let eval_key = EvalKey(key.clone().into());
+            if !work.contains_key(&eval_key) {
                 if !create_path {
                     bail!("La clé intermédiaire `{key}` du chemin n'existe pas");
                 }
-                work.insert(key.clone(), container_for(&remaining[0]));
+                work.insert(eval_key.clone(), container_for(&remaining[0]));
             }
             write_nested_tag_value(
-                work.get_mut(key).expect("clé insérée"),
+                work.get_mut(&eval_key).expect("clé insérée"),
                 remaining,
                 value,
                 create_path,
@@ -2760,13 +2775,16 @@ fn selected_tag_ids(
     formula: &mut FormulaEngine,
     env: &Env,
 ) -> Result<Vec<Arc<str>>> {
-    let cenv = character.env(formula, env)?;
+    let cenv = mk_character_env(character, formula, env)?;
     let base_env = cenv.merged(env);
     if let TagFilter::Id(tag) = filter {
         return Ok(vec![formula.fmt_value(tag, &base_env)?.into()]);
     }
     let mut candidates = Vec::new();
     for (tag, value) in character.story_tags.iter() {
+        let EvalKey(EvalValue::String(tag)) = tag else {
+            bail!("Tag key is not a string: {tag:?}");
+        };
         if filter.matches(tag, value, character, formula, &base_env)? {
             candidates.push(tag.clone());
         }
@@ -2790,7 +2808,7 @@ fn apply_set_tags(
     env: &Env,
 ) -> Result<PageEffectResult> {
     if let (TagFilter::Id(id), None) = (filter, &path) {
-        let mut base_env = character.base_env(formula, env)?.with_parent(env);
+        let mut base_env = mk_character_base_env(character, formula, env)?.with_parent(env);
         let resolved_path = formula.fmt_value(id, &base_env)?;
         let destination = character.find_tag_value(&resolved_path, create_path, EvalValue::Null)?;
         let old_value = destination.clone();
@@ -2798,8 +2816,7 @@ fn apply_set_tags(
         base_env.insert("valeur", destination.clone());
         let resolved_value = formula.resolve_formula(value, &base_env)?;
         *destination = resolved_value.clone();
-        let notif_env = character
-            .base_env(formula, env)?
+        let notif_env = mk_character_base_env(character, formula, env)?
             .expand(tag_notification_env(&resolved_path, resolved_value, old_value))
             .with_parent(env);
         let notice = notification
@@ -2818,13 +2835,13 @@ fn apply_set_tags(
     let tags = selected_tag_ids(character, filter, selection, formula, env)?;
     let mut shows = Vec::new();
     for tag in tags {
-        let tag_exists = character.story_tags.contains_key(&tag);
+        let tag_exists = character.story_tags.contains_key(&EvalKey(tag.clone().into()));
         let root_old = character
             .story_tags
-            .get(&tag)
+            .get(&EvalKey(tag.clone().into()))
             .cloned()
             .unwrap_or(EvalValue::Null);
-        let charenv = character.env(formula, env)?;
+        let charenv = mk_character_env(character, formula, env)?;
         let mut effect_env = charenv.merged(env);
         effect_env.insert("tag", EvalValue::String(tag.clone()));
         effect_env.insert("valeur", root_old.clone());
@@ -2855,9 +2872,8 @@ fn apply_set_tags(
             (root_old.clone(), resolved.clone(), None, resolved)
         };
         let work = Arc::make_mut(&mut character.story_tags);
-        work.insert(tag.clone(), root_new);
-        let mut notif_env = character
-            .base_env(formula, env)?
+        work.insert(EvalKey(tag.clone().into()), root_new);
+        let mut notif_env = mk_character_base_env(character, formula, env)?
             .expand(tag_notification_env(&tag, resolved, old_value))
             .with_parent(env);
         if let Some(path) = resolved_path {
@@ -2893,7 +2909,7 @@ fn apply_increment_tags(
     env: &Env,
 ) -> Result<PageEffectResult> {
     if let (TagFilter::Id(id), None) = (filter, &path) {
-        let mut base_env = character.base_env(formula, env)?.with_parent(env);
+        let mut base_env = mk_character_base_env(character, formula, env)?.with_parent(env);
         let resolved_path = formula.fmt_value(id, &base_env)?;
         let destination = character.find_tag_value(&resolved_path, create_path, EvalValue::Int(0))?;
         let old_value = destination.clone();
@@ -2902,8 +2918,7 @@ fn apply_increment_tags(
         let resolved_value = formula.resolve_formula(amount, &base_env)?;
         let result = destination.try_add(&resolved_value)?;
         *destination = result.clone();
-        let mut notif_env = character
-            .base_env(formula, env)?
+        let mut notif_env = mk_character_base_env(character, formula, env)?
             .expand(tag_notification_env(&resolved_path, result, old_value))
             .with_parent(env);
         notif_env.insert("valeur", resolved_value);
@@ -2923,10 +2938,10 @@ fn apply_increment_tags(
     let tags = selected_tag_ids(character, filter, selection, formula, env)?;
     let mut shows = Vec::new();
     for tag in tags {
-        let tag_exists = character.story_tags.contains_key(&tag);
+        let tag_exists = character.story_tags.contains_key(&EvalKey(tag.clone().into()));
         let root_old = character
             .story_tags
-            .get(&tag)
+            .get(&EvalKey(tag.clone().into()))
             .cloned()
             .unwrap_or_else(|| {
                 if path.is_some() {
@@ -2935,7 +2950,7 @@ fn apply_increment_tags(
                     EvalValue::Int(0)
                 }
             });
-        let charenv = character.env(formula, env)?;
+        let charenv = mk_character_env(character, formula, env)?;
         let mut effect_env = charenv.merged(env);
         effect_env.insert("tag", EvalValue::String(tag.clone()));
         effect_env.insert("valeur", root_old.clone());
@@ -2980,9 +2995,8 @@ fn apply_increment_tags(
             )
         };
         let work = Arc::make_mut(&mut character.story_tags);
-        work.insert(tag.clone(), root_new);
-        let mut notif_env = character
-            .base_env(formula, env)?
+        work.insert(tag.clone().into(), root_new);
+        let mut notif_env = mk_character_base_env(character, formula, env)?
             .expand(tag_notification_env(&tag, resolved, old_value))
             .with_parent(env);
         notif_env.insert("montant", increment);
@@ -3013,7 +3027,7 @@ fn apply_remove_tags(
     env: &Env,
 ) -> Result<PageEffectResult> {
     if let (TagFilter::Id(id), None) = (filter, &path) {
-        let base_env = character.base_env(formula, env)?.with_parent(env);
+        let base_env = mk_character_base_env(character, formula, env)?.with_parent(env);
         let resolved_path = formula.fmt_value(id, &base_env)?;
         let Some(old_value) = character.remove_tag_value(
             &resolved_path
@@ -3029,8 +3043,7 @@ fn apply_remove_tags(
         let mut notif_env = Env::new();
         notif_env.insert("tag", EvalValue::String(resolved_path.clone()));
         notif_env.insert("valeur", old_value);
-        let notif_env = character
-            .base_env(formula, env)?
+        let notif_env = mk_character_base_env(character, formula, env)?
             .expand(notif_env)
             .with_parent(env);
         let notice = notification
@@ -3049,7 +3062,7 @@ fn apply_remove_tags(
     let tags = selected_tag_ids(character, filter, selection, formula, env)?;
     let mut shows = Vec::new();
     for tag in tags {
-        let charenv = character.env(formula, env)?;
+        let charenv = mk_character_env(character, formula, env)?;
         let base_env = charenv.merged(env);
         let mut tenv = Env::new();
         tenv.insert("tag", EvalValue::String(tag.clone()));
@@ -3098,14 +3111,11 @@ fn tag_notification_env(tag: &str, value: EvalValue, old_value: EvalValue) -> En
 /// The returned environment owns cloned bindings, so callers may extend it without
 /// mutating the source character, page, item, or state.
 fn item_notification_env<'a>(
-    stack: &ItemStack,
-    formula: &mut FormulaEngine,
+    character_env: &Env<'_>,
+    item_idx: usize,
     base_env: &'a Env<'a>,
 ) -> Result<Env<'a>> {
-    let values = stack.resolved_metadata(formula, base_env)?;
-    let mut env = Env::new();
-
-    env.insert("objet", EvalValue::Object(Arc::from(values)));
+    let env = mk_item_env(character_env, item_idx)?;
     Ok(env.with_parent(base_env))
 }
 
@@ -3114,13 +3124,11 @@ fn item_notification_env<'a>(
 /// The returned environment owns cloned bindings, so callers may extend it without
 /// mutating the source character, page, item, or state.
 fn condition_notification_env<'a>(
-    condition: &ConditionInstance,
-    formula: &mut FormulaEngine,
+    charenv: &Env<'_>,
+    condition_idx: usize,
     base_env: &'a Env<'a>,
 ) -> Result<Env<'a>> {
-    let values = condition.resolved_metadata(formula, base_env)?;
-    let mut env = Env::new();
-    env.insert("etat", EvalValue::Object(Arc::from(values)));
+    let env = mk_condition_env(charenv, condition_idx)?;
     Ok(env.with_parent(base_env))
 }
 
@@ -3158,11 +3166,11 @@ fn simple_notification(
     let mut nenv = Env::new();
     nenv.insert("ancienne", ancienne);
     nenv.insert("valeur", valeur);
-    let charenv = character.env(formula, env)?;
+    let charenv = mk_character_env(character, formula, env)?;
     let nenv = nenv.with_parent(env).with_parent(&charenv);
     let notif = notification
         .as_ref()
-        .map(|n| Ok::<Arc<str>, anyhow::Error>(formula.resolve_formula(&n, &nenv)?.python_string()))
+        .map(|n| Ok::<Arc<str>, anyhow::Error>(formula.resolve_formula(&n, &nenv)?.repr()))
         .transpose()?
         .unwrap_or_else(default);
     Ok(if notif.is_empty() {

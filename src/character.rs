@@ -5,12 +5,11 @@
 //! current HP, morale, tags, inventory data, and condition data come from the save.
 use std::sync::Arc;
 
-use crate::effects::{Deferred, TagPathSegment};
-use crate::formula::{
-    CharacterView, Env, EvalValue, EvalValueSerializer, FormulaConditionView, FormulaEngine, FormulaItemView
-};
+use crate::effects::{TagPathSegment};
+use crate::formula::{dict_to_map, map_to_dict, mk_condition_env, mk_partial_character_env};
 use crate::model::{ConditionInstance, ItemStack, Modifier, Tale};
 use anyhow::{anyhow, bail, Context, Result};
+use formulas::{Env, EvalKey, EvalValue, EvalValueSerializer, FormulaEngine};
 use indexmap::IndexMap;
 use indexmap::map::Entry;
 use serde::{Deserialize, Serialize};
@@ -26,7 +25,7 @@ pub struct Character {
     pub max_morale: i64,
     pub morale: i64,
     pub conditions: Vec<ConditionInstance>,
-    pub story_tags: Arc<IndexMap<Arc<str>, EvalValue>>,
+    pub story_tags: Arc<IndexMap<EvalKey, EvalValue>>,
 }
 
 impl Character {
@@ -46,7 +45,7 @@ impl Character {
     pub fn new_with_tags(
         attributes: &[Arc<str>],
         name: Option<Arc<str>>,
-        initial_tags: &IndexMap<Arc<str>, EvalValue>,
+        initial_tags: &IndexMap<EvalKey, EvalValue>,
     ) -> Self {
         Self {
             name,
@@ -61,7 +60,7 @@ impl Character {
             max_morale: 12,
             morale: 12,
             conditions: Vec::new(),
-            story_tags: Arc::new(initial_tags.iter().map(|(k, v)| (k.clone().into(), v.clone())).collect()),
+            story_tags: Arc::new(initial_tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
         }
     }
     /// Returns `Ok(())` when the character defines `attribute`.
@@ -78,16 +77,17 @@ impl Character {
     }
 
     /// Adds an item stack, merging it with an identical existing stack when possible.
-    pub fn add_item(&mut self, item_stack: ItemStack) {
-        for stack in &mut self.inventory {
+    pub fn add_item(&mut self, item_stack: ItemStack) -> usize {
+        for (i, stack) in self.inventory.iter_mut().enumerate() {
             if stack.item.id == item_stack.item.id
                 && stack.actual_data() == item_stack.actual_data()
             {
                 stack.quantity += item_stack.quantity;
-                return;
+                return i;
             }
         }
         self.inventory.push(item_stack);
+        self.inventory.len() - 1
     }
     /// Returns the base attribute plus all stacked persistent-state modifiers.
     ///
@@ -97,12 +97,13 @@ impl Character {
     pub fn actual_attribute(&self, attribute: &str, formula: &mut FormulaEngine, env: &Env) -> Result<i64> {
         self.ensure_attribute(attribute)?;
         let base = self.attributes[attribute];
-        let env = self.nonactual_env().with_parent(env);
+        let env = mk_partial_character_env(self)?.with_parent(env);
         let modifiers = self
             .conditions
             .iter()
-            .map(|condition| {
-                let env = condition.env(formula, &env)
+            .enumerate()
+            .map(|(i, condition)| {
+                let env = mk_condition_env(&env, i)
                     .with_context(|| "Erreur d'environement d'état en calculant un attribut actuel")?
                     .with_parent(&env);
                 let mods = condition.template.effects
@@ -161,7 +162,7 @@ impl Character {
     }
     /// Returns base maximum hit points plus stacked state modifiers, clamped to zero.
     pub fn actual_max_hp(&self, formula: &mut FormulaEngine, env: &Env) -> Result<i64> {
-        let env = self.nonactual_env().with_parent(env);
+        let env = mk_partial_character_env(self)?.with_parent(env);
         let modifiers = self
             .conditions
             .iter()
@@ -186,8 +187,7 @@ impl Character {
     }
     /// Returns base maximum morale plus stacked state modifiers, clamped to zero.
     pub fn actual_max_morale(&self, formula: &mut FormulaEngine, env: &Env) -> Result<i64> {
-        let nonenv = self.nonactual_env();
-        let env = env.merged(&nonenv);
+        let env = mk_partial_character_env(self)?.with_parent(env);
         let modifiers = self
             .conditions
             .iter()
@@ -307,206 +307,6 @@ impl Character {
         }
         self.inventory = normalized;
     }
-    /// Creates an owned, read-only snapshot exposed to formulas.
-    ///
-    /// Derived attributes and resource maxima are calculated at snapshot time; later character mutations do not affect the returned view.
-    pub fn view(&self, formula: &mut FormulaEngine, env: &Env) -> Result<CharacterView> {
-        Ok(CharacterView {
-            name: self.name.clone(),
-            pv: self.hp,
-            max_pv: self
-                .actual_max_hp(formula, env)
-                .context("Construction de `personnage`: calcul de `max_pv`")?,
-            moral: self.morale,
-            max_moral: self
-                .actual_max_morale(formula, env)
-                .context("Construction de `personnage`: calcul de `max_moral`")?,
-            attributes: self
-                .attributes
-                .keys()
-                .map(|attribute| {
-                    self.actual_attribute(attribute, formula, env)
-                        .with_context(|| {
-                            format!(
-                                "Construction de `personnage`: calcul de l'attribut `{attribute}`"
-                            )
-                        })
-                        .map(|value| (attribute.clone(), EvalValue::Int(value)))
-                })
-                .collect::<Result<IndexMap<_, _>>>()?
-                .into(),
-            tags: self.story_tags.clone(),
-            items: self
-                .inventory
-                .iter()
-                .map(|stack| Ok(FormulaItemView {
-                    id: stack.item.id.clone(),
-                    name: stack.item.name.clone(),
-                    description: stack.item.description.clone(),
-                    quantity: stack.quantity,
-                    traits: {
-                        let env = self.nonactual_env().with_parent(env);
-                        let stack_env = stack.env(formula, &env)
-                            .with_context(|| "Erreur en construisant l'environement d'objet dans la vue de personnage")?
-                            .with_parent(&env);
-                        // extract traits
-                        stack_env.get("objet").map(|obj| {
-                            let EvalValue::Object(obj) = obj else {
-                                bail!("L'environnement d'objet ne contient pas un objet pour la vue de personnage")
-                            };
-                            obj.get("traits").map(|traits| {
-                                let EvalValue::Array(traits) = traits else {
-                                    bail!("L'environnement d'objet ne contient pas un tableau de traits pour la vue de personnage")
-                                };
-                                traits
-                                    .iter()
-                                    .map(|t| match t {
-                                        EvalValue::String(s) => Ok(s.clone()),
-                                        other => bail!("Un trait d'objet dans la vue de personnage n'est pas une chaîne: {:?}", other),
-                                    })
-                                    .collect::<Result<Vec<_>>>()
-                            }).ok_or_else(|| anyhow!("'objet' ne contient pas de champ 'traits'"))
-                        }).ok_or_else(|| anyhow!("L'environement d'objet ne contient pas de champ 'objet'"))
-                        .with_context(|| "Erreur en collectant les traits d'objet dans la création de vue du personnage")?
-                        .with_context(|| "Erreur en collectant les traits d'objet dans la création de vue du personnage")?
-                        .with_context(|| "Erreur en collectant les traits d'objet dans la création de vue du personnage")?
-                        .into()
-                    },
-                    data: stack.actual_data(),
-                }))
-                .collect::<Result<Vec<_>>>()
-                .with_context(|| "Erreur en créant la vue d'objet pour la création de vue de personnage")?
-                .into(),
-            conditions: self
-                .conditions
-                .iter()
-                .map(|condition| {
-                    Ok(FormulaConditionView {
-                        id: condition.template.id.clone(),
-                        name: condition.template.name.clone(),
-                        description: condition.template.description.clone(),
-                        traits: {
-                            let env = self.nonactual_env().with_parent(env);
-                            let stack_env = condition.env(formula, &env)
-                                .with_context(|| "Erreur en construisant l'environement d'etat dans la vue de personnage")?
-                                .with_parent(&env);
-                            // extract traits
-                            stack_env.get("etat").map(|obj| {
-                                let EvalValue::Object(obj) = obj else {
-                                    bail!("L'environnement d'etat ne contient pas un objet pour la vue de personnage")
-                                };
-                                obj.get("traits").map(|traits| {
-                                    let EvalValue::Array(traits) = traits else {
-                                        bail!("L'environnement d'etat ne contient pas un tableau de traits pour la vue de personnage")
-                                    };
-                                    traits
-                                        .iter()
-                                        .map(|t| match t {
-                                            EvalValue::String(s) => Ok(s.clone()),
-                                            other => bail!("Un trait d'etat dans la vue de personnage n'est pas une chaîne: {:?}", other),
-                                        })
-                                        .collect::<Result<Vec<_>>>()
-                                }).ok_or_else(|| anyhow!("'etat' ne contient pas de champ 'traits'"))
-                            }).ok_or_else(|| anyhow!("L'environement d'etat ne contient pas de champ 'etat'"))
-                            .with_context(|| "Erreur en collectant les traits d'etat dans la création de vue du personnage")?
-                            .with_context(|| "Erreur en collectant les traits d'etat dans la création de vue du personnage")?
-                            .with_context(|| "Erreur en collectant les traits d'etat dans la création de vue du personnage")?
-                            .into()
-                        },
-                        data: condition.data.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-                .with_context(|| "Erreur en construisant les vues d'etat pour la création de vue de personnage")?
-                .into(),
-        })
-    }
-
-    /// Builds the formula environment exposed by the current runtime value.
-    ///
-    /// The returned environment owns cloned bindings, so callers may extend it without
-    /// mutating the source character, page, item, or state.
-    pub fn env<'a>(&self, formula: &mut FormulaEngine, env: &'a Env<'a>) -> Result<Env<'static>> {
-        let view = self.view(formula, env)?;
-        let mut env = Env::new();
-        for (attribute, value) in view.attributes.iter() {
-            env.insert(attribute.clone(), value.clone());
-        }
-        for (tag, value) in self.story_tags.iter() {
-            env.insert(tag.clone(), value.clone());
-        }
-        env.insert("personnage", EvalValue::Character(view.clone()));
-        env.insert(
-            "nom",
-            view.name
-                .clone()
-                .map(EvalValue::String)
-                .unwrap_or(EvalValue::Null),
-        );
-        env.insert("max_moral", EvalValue::Int(view.max_moral));
-        env.insert("max_pv", EvalValue::Int(view.max_pv));
-        env.insert("moral", EvalValue::Int(view.moral));
-        env.insert("pv", EvalValue::Int(view.pv));
-        Ok(env)
-    }
-
-    /// Builds the restricted formula environment used during instantiation.
-    ///
-    /// The returned environment owns cloned bindings, so callers may extend it without
-    /// mutating the source character, page, item, or state.
-    pub fn base_env(&self, formula: &mut FormulaEngine, env: &Env) -> Result<Env<'static>> {
-        let view = self.view(formula, env)?;
-        let mut env = Env::new();
-        env.insert("personnage", EvalValue::Character(view));
-        Ok(env)
-    }
-
-    pub fn nonactual_env(&self) -> Env<'static> {
-        let view = CharacterView {
-            name: self.name.clone(),
-            pv: self.hp,
-            max_pv: self.max_hp,
-            moral: self.morale,
-            max_moral: self.max_morale,
-            attributes: Arc::from(self.attributes.iter().map(|(attribute, value)| (attribute.clone(), EvalValue::Int(*value)))
-                .collect::<IndexMap<_, _>>()),
-            tags: self.story_tags.clone(),
-            items: self
-                .inventory
-                .iter()
-                .map(|stack| FormulaItemView {
-                    id: stack.item.id.clone(),
-                    name: stack.item.name.clone(),
-                    description: stack.item.description.clone(),
-                    quantity: stack.quantity,
-                    traits: stack.item.traits.iter().filter_map(|t| match t {
-                        Deferred::Literal(s) => Some(s.clone()),
-                        Deferred::Formula(_) => None,
-                    }).collect::<Vec<_>>()
-                    .into(),
-                    data: stack.data.clone(),
-                })
-                .collect(),
-            conditions: self
-                .conditions
-                .iter()
-                .map(|condition| FormulaConditionView {
-                    id: condition.template.id.clone(),
-                    name: condition.template.name.clone(),
-                    description: condition.template.description.clone(),
-                    traits: condition.template.traits.iter().filter_map(|t| match t {
-                        Deferred::Literal(s) => Some(s.clone()),
-                        Deferred::Formula(_) => None,
-                    }).collect::<Vec<_>>()
-                    .into(),
-                    data: condition.data.clone(),
-                })
-                .collect(),
-        };
-        let mut env = Env::new();
-        env.insert("personnage", EvalValue::Character(view));
-        env
-    }
 
     /// Returns whether both hit points and morale remain above zero.
     pub fn is_alive(&self) -> bool {
@@ -528,20 +328,25 @@ impl Character {
         for stack in &self.inventory {
             let mut data = IndexMap::new();
             for (key, value) in stack.data.iter() {
-                data.insert(String::from(key.as_ref()), value.into());
+                data.insert(key.clone(), value.clone());
             }
             stacks.push(SavedItemStack {
                 item_id: String::from(stack.item.id.as_ref()),
                 quantity: stack.quantity,
-                data,
+                data: dict_to_map(data)?.into_iter()
+                    .map(|(k, v)| (String::from(k.as_ref()), EvalValueSerializer::from(&v)))
+                    .collect(),
             });
         }
         let mut conditions = Vec::new();
         for condition in &self.conditions {
             let mut data = IndexMap::new();
             for (key, value) in condition.data.iter() {
-                data.insert(key.as_ref().into(), value.into());
+                data.insert(key.clone(), value.clone());
             }
+            let data = dict_to_map(data)?.into_iter()
+                .map(|(k, v)| (String::from(k.as_ref()), EvalValueSerializer::from(&v)))
+                .collect::<IndexMap<_, _>>();
             conditions.push(SavedCondition {
                 id: condition.template.id.as_ref().into(),
                 data,
@@ -577,7 +382,7 @@ impl Character {
         character.story_tags = Arc::from(saved
             .story_tags
             .into_iter()
-            .map(|(tag, value)| Ok((tag.into(), value.try_into()?)))
+            .map(|(tag, value)| Ok((EvalKey(EvalValue::String(tag.into())), value.try_into()?)))
             .collect::<Result<IndexMap<_, _>, anyhow::Error>>()?);
 
         for saved_stack in saved.inventory {
@@ -594,11 +399,11 @@ impl Character {
             character.inventory.push(ItemStack {
                 item,
                 quantity: saved_stack.quantity,
-                data: saved_stack
+                data: map_to_dict(saved_stack
                     .data
                     .into_iter()
                     .map(|(k, v)| Ok((k.into(), v.try_into()?)))
-                    .collect::<Result<IndexMap<Arc<str>, EvalValue>, anyhow::Error>>()?.into(),
+                    .collect::<Result<IndexMap<Arc<str>, EvalValue>, anyhow::Error>>()?).into(),
             });
         }
 
@@ -611,11 +416,11 @@ impl Character {
             })?;
             character.conditions.push(ConditionInstance {
                 template: template.clone(),
-                data: saved_condition
+                data: map_to_dict(saved_condition
                     .data
                     .into_iter()
                     .map(|(k, v)| Ok((k.into(), v.try_into()?)))
-                    .collect::<Result<IndexMap<Arc<str>, EvalValue>, anyhow::Error>>()?.into(),
+                    .collect::<Result<IndexMap<Arc<str>, EvalValue>, anyhow::Error>>()?).into(),
             });
         }
 
@@ -641,7 +446,7 @@ impl Character {
         }
         let mut current_id = parts.remove(0);
         let work = Arc::make_mut(&mut self.story_tags);
-        let current_value = work.entry(current_id.into());
+        let current_value = work.entry(EvalKey(EvalValue::String(current_id.into())));
         let mut current_value = match current_value {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
@@ -660,7 +465,7 @@ impl Character {
                 }
                 (EvalValue::Object(map), Err(_)) => {
                     let work = Arc::make_mut(map);
-                    current_value = match work.entry(current_id.into()) {
+                    current_value = match work.entry(EvalKey(current_id.into())) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
                             if create_path {
@@ -709,7 +514,7 @@ impl Character {
         let mut current_id = parts.remove(0);
         let work = Arc::make_mut(&mut self.story_tags);
         let current_value = work.entry(match current_id {
-            TagPathSegment::Key(ref key) => key.clone(),
+            TagPathSegment::Key(ref key) => EvalKey(EvalValue::String(key.clone())),
             TagPathSegment::Index(idx) => bail!("Le chemin de tag ne peut pas commencer par un index de tableau ({idx})"),
         });
         let mut current_value = match current_value {
@@ -735,7 +540,7 @@ impl Character {
                 }
                 (EvalValue::Object(map), TagPathSegment::Key(key)) => {
                     let work = Arc::make_mut(map);
-                    current_value = match work.entry(key.into()) {
+                    current_value = match work.entry(EvalKey(EvalValue::String(key.into()))) {
                         Entry::Occupied(entry) => {
                             if parts.is_empty() {
                                 return Ok(Some(entry.shift_remove()));
@@ -779,7 +584,7 @@ impl Character {
 
 fn insert_next<'a>(
     next_id: Option<&str>,
-    entry: indexmap::map::VacantEntry<'a, Arc<str>, EvalValue>,
+    entry: indexmap::map::VacantEntry<'a, EvalKey, EvalValue>,
     default_value: &EvalValue,
 ) -> &'a mut EvalValue {
     match next_id {
@@ -791,7 +596,7 @@ fn insert_next<'a>(
                 entry.insert(EvalValue::Array(array.into()))
             } else {
                 let mut map = IndexMap::new();
-                map.insert(next_id.into(), default_value.clone());
+                map.insert(EvalKey(EvalValue::from(next_id)), default_value.clone());
                 entry.insert(EvalValue::Object(map.into()))
             }
         }
@@ -863,8 +668,8 @@ pub struct SavedCondition {
 #[cfg(test)]
 mod tests {
     use super::Character;
-    use crate::formula::{Env, FormulaEngine};
-    use crate::model::Tale;
+    use formulas::{Env, FormulaEngine};
+    use crate::{formula::mk_character_base_env, model::Tale};
     use indexmap::IndexMap;
     use serde_json::json;
 
@@ -886,9 +691,9 @@ mod tests {
         .unwrap();
         let mut formula = FormulaEngine::new(Some(1));
         let mut character = Character::new(&tale.attributes, None);
-        let env = &character.base_env(&mut formula, &Env::new()).expect("Formula failed");
+        let env = &mk_character_base_env(&character, &mut formula, &Env::new()).expect("Formula failed");
         let condition = tale.conditions["veille"]
-            .instantiate(&&crate::formula::EvalValue::Object(IndexMap::new().into()), &mut formula, &env)
+            .instantiate(&formulas::EvalValue::Object(IndexMap::new().into()), &mut formula, &env)
             .unwrap();
         character.conditions.push(condition);
 
