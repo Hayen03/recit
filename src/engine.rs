@@ -6,7 +6,7 @@
 use crate::character::Character;
 use crate::effects::{Cell, Deferred, PageEffect};
 use crate::error_report::format_error;
-use crate::formula::{mk_character_base_env, mk_character_env, mk_condition_env, mk_page_env};
+use crate::formula::{mk_character_base_env, mk_character_env, mk_condition_env, mk_new_condition_env, mk_page_env};
 use formulas::builtins::GLOBAL_ENV;
 use formulas::{Env, EvalKey, EvalValue, FormulaClosure, FormulaEngine, Function};
 use crate::images::{ImageRegistry, ImageResult, fit_in_terminal};
@@ -40,6 +40,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ("Q", "[Q]uitter"),
 ];
 const DEBUG_COMMAND: (&str, &str) = ("T", "[T]ags");
+pub const CAPTURE_IGNORE: &[&str] = &[
+    "personnage",
+    "recit",
+    "page",
+    "test",
+    "etat",
+    "objet",
+    "connexion",
+];
 
 /// Coordinates tale execution, character state, page transitions, and user interaction.
 pub struct Game {
@@ -426,7 +435,9 @@ impl Game {
             }
             env.with_parent(&GLOBAL_ENV)
         };
-        let formula = FormulaEngine::new(seed).with_globals(globals);
+        let formula = FormulaEngine::new(seed)
+            .with_globals(globals)
+            .with_capture_ignore(CAPTURE_IGNORE.iter().map(|s| Arc::from(*s)).collect());
         Self {
             tale,
             formula,
@@ -758,7 +769,7 @@ impl Game {
         next_page: &mut Option<Arc<str>>,
     ) -> Result<()> {
         let conditions = character.conditions.clone();
-        for (idx, condition) in conditions.iter().enumerate() {
+        for (_idx, condition) in conditions.iter().enumerate() {
             if next_page.is_some() {
                 break;
             }
@@ -775,7 +786,7 @@ impl Game {
                 })?;
             let base_env = charenv.merged(&env);
 
-            let condition_env = mk_condition_env(&base_env, idx)?.with_parent(&base_env);
+            let condition_env = mk_new_condition_env(&condition, &mut self.formula, &base_env)?.with_parent(&base_env);
             let cells = eval_cells(&cells, &mut self.formula, &condition_env)
                 .with_context(|| format!("Erreur en évaluant les cellules de l'état {}", condition_id))?;
             if cells.is_empty() {
@@ -1847,7 +1858,8 @@ fn push_messages(term: &Terminal, messages: &[Message], text: &mut StringBuilder
 
 /// Replaces every complete `$[…]` segment with an optionally styled span.
 ///
-/// A `#RRGGBB|` prefix selects a custom foreground color. An empty `highlight_style`
+/// A decimal RGB integer in `0..=0xFFFFFF` or a `#RRGGBB` prefix followed by `|`
+/// selects a custom foreground color. An empty `highlight_style`
 /// disables colors but still removes valid color prefixes and span delimiters.
 /// Unclosed markers are copied literally. `resume_style` is inserted after each highlighted span
 /// so the caller's surrounding message style remains active.
@@ -1862,11 +1874,20 @@ fn render_highlights(text: &str, highlight_style: &str, resume_style: &str) -> S
             return output;
         };
         let content = &remaining[content_start..content_start + end];
-        let custom_color = content
-            .strip_prefix('#')
-            .and_then(|content| content.split_once('|'))
-            .filter(|(hex, _)| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-            .and_then(|(hex, body)| u32::from_str_radix(hex, 16).ok().map(|rgb| (rgb, body)));
+        let custom_color = content.split_once('|').and_then(|(header, body)| {
+            let rgb = if let Some(hex) = header.strip_prefix('#') {
+                if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return None;
+                }
+                u32::from_str_radix(hex, 16).ok()?
+            } else {
+                if header.is_empty() || !header.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                header.parse::<u32>().ok()?
+            };
+            (rgb <= 0xFFFFFF).then_some((rgb, body))
+        });
         if let Some((rgb, body)) = custom_color {
             if !highlight_style.is_empty() {
                 output.push_str(&format!(
@@ -1975,6 +1996,25 @@ use super::{
     }
 
     #[test]
+    fn highlighted_text_supports_integer_rgb_bounds_and_plain_text() {
+        let plain = test_terminal();
+        let colored = Terminal {
+            color: true,
+            ..test_terminal()
+        };
+        let text = "Une $[16746496|lueur | dorée] puis $[0|noir]$[16777215|blanc].";
+        assert_eq!(
+            colored.styled_text(text, colored.effects()),
+            "Une \x1b[38;2;255;136;0mlueur | dorée\x1b[33m puis \x1b[38;2;0;0;0mnoir\x1b[33m\x1b[38;2;255;255;255mblanc\x1b[33m."
+        );
+        assert_eq!(
+            plain.styled_text(text, plain.effects()),
+            "Une lueur | dorée puis noirblanc."
+        );
+        assert_eq!(plain.styled_text("$[0|]", plain.reset()), "");
+    }
+
+    #[test]
     fn highlighted_text_preserves_invalid_color_headers_and_unclosed_spans() {
         let plain = test_terminal();
         let colored = Terminal {
@@ -1988,6 +2028,16 @@ use super::{
             "#123456",
             "#ééé|texte",
             "choix|autre",
+            "16777216|hors limites",
+            "4294967296|débordement",
+            "999999999999999999999999999999|trop grand",
+            "-1|négatif",
+            "+1|signe",
+            "1.5|flottant",
+            " 1|espace",
+            "١|chiffre non ASCII",
+            "|sans couleur",
+            "123456",
         ] {
             let text = format!("$[{body}]");
             assert_eq!(plain.styled_text(&text, plain.reset()), body);
@@ -1997,28 +2047,42 @@ use super::{
             );
         }
         for terminal in [plain, colored] {
-            let text = "Une $[#FF8800|lueur inachevée";
-            assert_eq!(terminal.styled_text(text, terminal.reset()), text);
+            for text in ["Une $[#FF8800|lueur inachevée", "Une $[16746496|lueur inachevée"] {
+                assert_eq!(terminal.styled_text(text, terminal.reset()), text);
+            }
         }
     }
 
     #[test]
-    fn highlighted_text_accepts_interpolated_color_strings() {
+    fn highlighted_text_accepts_interpolated_integer_colors() {
         let mut formula = formulas::FormulaEngine::new(Some(1));
         let mut env = Env::new();
         env.insert("couleur", EvalValue::Int(0x44CC88));
         env.insert("pv", 7.into());
-        let text = formula
-            .format("$[${couleur}|PV : ${pv}]".into(), &env)
-            .unwrap();
         let colored = Terminal {
             color: true,
             ..test_terminal()
         };
-        assert_eq!(
-            colored.styled_text(&text, colored.reset()),
-            "\x1b[38;2;68;204;136mPV : 7\x1b[0m"
-        );
+        let plain = test_terminal();
+        for (source, pv, rgb) in [
+            ("$[${couleur}|PV : ${pv}]", 7, "68;204;136"),
+            ("$[${#44CC88}|PV : ${pv}]", 7, "68;204;136"),
+            ("$[${#FF4444 if pv < 5 else #44CC88}|PV : ${pv}]", 3, "255;68;68"),
+            ("$[${#FF4444 if pv < 5 else #44CC88}|PV : ${pv}]", 7, "68;204;136"),
+        ] {
+            env.insert("pv", pv.into());
+            let value = formulas::split_fmt_str(source).unwrap();
+            for text in [
+                formula.format(source.into(), &env).unwrap(),
+                formula.fmt_value(&value, &env).unwrap(),
+            ] {
+                assert_eq!(
+                    colored.styled_text(&text, colored.reset()),
+                    format!("\x1b[38;2;{rgb}mPV : {pv}\x1b[0m")
+                );
+                assert_eq!(plain.styled_text(&text, plain.reset()), format!("PV : {pv}"));
+            }
+        }
     }
 
     // Verifies that null poll default means the answer is required.
@@ -2265,7 +2329,7 @@ use super::{
         assert_eq!(character.story_tags.get(&EvalKey("effet".into())), Some(&EvalValue::Int(4)));
     }
 
-    // Verifies state lifecycle cells and their resolved `condition` environment.
+    // Verifies state lifecycle cells and their resolved `etat` environment.
     #[test]
     fn condition_cells_receive_metadata_before_and_after_page_cells() {
         let tale = Tale::from_json(&json!({
@@ -2278,14 +2342,14 @@ use super::{
                     "nom": "Brûlure $intensite",
                     "donnees": {"intensite": 2},
                     "avant": [
-                        "${[{'effets': [{'type': 'definir_tag', 'filtre': 'avant_formule', 'valeur': condition.id, 'notification': ''}]}]}",
+                        "${[{'effets': [{'type': 'definir_tag', 'filtre': 'avant_formule', 'valeur': etat.id, 'notification': ''}]}]}",
                         {
-                            "conditions": {"type": "formule", "formule": "${condition.donnees.intensite == 2}"},
-                            "texte": "Avant: ${condition.nom}",
+                            "conditions": {"type": "formule", "formule": "${etat.donnees.intensite == 2}"},
+                            "texte": "Avant: ${etat.nom}",
                             "effets": [{
                                 "type": "definir_tag",
                                 "filtre": {"type": "id", "tag": "avant_id"},
-                                "valeur": "${condition.id}",
+                                "valeur": "${etat.id}",
                                 "notification": ""
                             }]
                         }
@@ -2294,7 +2358,7 @@ use super::{
                         "effets": [{
                             "type": "definir_tag",
                             "filtre": {"type": "id", "tag": "apres_intensite"},
-                            "valeur": "${condition.donnees.intensite}",
+                            "valeur": "${etat.donnees.intensite}",
                             "notification": ""
                         }]
                     }]

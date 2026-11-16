@@ -1392,26 +1392,27 @@ Une formule est délimitée par `${...}`. Une chaîne de caractères contenant u
 La grammaire complète du langage de formules est décrite dans la référence *Formulas* (`syntax.pdf`, source `syntax.typ`), disponible dans le #link("https://github.com/Hayen03/formulas")[dépôt du langage de formules].
 
 === Mise en évidence et couleurs du texte
-Dans les textes affichés par le joueur, `$[texte]` met le contenu en évidence en magenta clair. La forme `$[#RRGGBB|texte]` choisit une couleur de premier plan personnalisée: les six chiffres hexadécimaux représentent le rouge, le vert et le bleu, de `00` à `FF`. Les minuscules et majuscules sont acceptées.
+Dans les textes affichés par le joueur, `$[texte]` met le contenu en évidence en magenta clair. La forme `$[entier|texte]` choisit une couleur de premier plan personnalisée: l'entier représente une couleur RVB sur 24 bits, entre `0` (noir) et `16777215` (blanc), inclusivement. Ses trois octets représentent le rouge, le vert et le bleu. La notation directe `$[#RRGGBB|texte]` est également acceptée, avec exactement six chiffres hexadécimaux, en minuscules ou majuscules.
 
 ```json
 "Une $[lueur] apparaît."
+"Une $[16746496|lueur orange] apparaît."
 "Une $[#FF8800|lueur orange] apparaît."
 "$[#44cc88|Une porte verte] et $[#FF4444|une porte rouge]."
 ```
 
 Le crochet fermant restaure la couleur du message environnant. Avec `--sans-couleur`, les délimiteurs et les préfixes de couleur valides disparaissent, mais le texte reste affiché.
 
-Seul un préfixe composé de `#`, exactement six chiffres hexadécimaux et `|` sélectionne une couleur. Sinon, tout le contenu est traité comme une mise en évidence ordinaire: `$[#FFF|texte]` affiche donc `#FFF|texte` dans la couleur d'emphase. Les autres barres `|` restent du texte. Un marqueur sans crochet fermant est conservé littéralement; les marqueurs ne s'imbriquent pas et le premier `]` termine le segment.
+Le préfixe avant `|` doit contenir uniquement des chiffres décimaux ASCII formant un entier dans cet intervalle, ou `#` suivi d'exactement six chiffres hexadécimaux. Les signes, espaces et nombres fractionnaires ne sont pas acceptés. Sinon, tout le contenu est traité comme une mise en évidence ordinaire: `$[16777216|texte]` ou `$[#FFF|texte]` conserve donc son préfixe dans la couleur d'emphase. Les autres barres `|` restent du texte. Un marqueur sans crochet fermant est conservé littéralement; les marqueurs ne s'imbriquent pas et le premier `]` termine le segment.
 
-Les substitutions de formule précèdent la mise en couleur. Si `couleur` contient la chaîne `"#FF8800"`, on peut écrire:
+Les substitutions de formule précèdent la mise en couleur. Si `recit.couleur` contient l'entier `16746496` (soit `#FF8800` en notation hexadécimale dans une formule), on peut écrire:
 
 ```json
-"$[${couleur}|Votre torche faiblit.]"
-"$[${'#FF4444' if personnage.pv < 5 else '#44CC88'}|PV : ${personnage.pv}]"
+"$[${recit.couleur}|Votre torche faiblit.]"
+"$[${#FF4444 if personnage.pv < 5 else #44CC88}|PV : ${personnage.pv}]"
 ```
 
-La couleur calculée doit être une chaîne au format `#RRGGBB`. Dans une formule, le littéral numérique `#FF8800` est un entier et son interpolation produit un nombre décimal; utilisez la chaîne `'#FF8800'` pour p
+Dans une formule, le littéral `#FF8800` est un entier. Son interpolation produit le nombre décimal `16746496`, reconnu comme la même couleur par le moteur d'affichage. La couleur peut donc être calculée par une expression numérique.
 
 == Fonctionnement et déroulement du jeu
 Cette section décrit l'ordre observable du moteur. Il est important: les effets modifient le personnage, les formules suivantes voient ces mutations, tandis que les tags de page, de connexion et le résultat d'un test sont des instantanés liés à une transition.
@@ -1478,7 +1479,7 @@ Chaque liste conserve son ordre. Les formules de cellules sont évaluées au dé
 === Exécution d'une cellule
 Une cellule suit cet ordre:
 
-1. sa condition est évaluée avec le personnage courant et les environnements de page, connexion, test et récit; une cellule d'état reçoit aussi `condition`;
+1. sa condition est évaluée avec le personnage courant et les environnements de page, connexion, test et récit; une cellule d'état reçoit aussi `etat`;
 2. si elle est fausse, effets et texte sont tous ignorés;
 3. la liste des effets est construite; une formule peut retourner un effet ou une liste;
 4. les effets s'exécutent un par un dans l'ordre;

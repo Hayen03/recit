@@ -322,7 +322,7 @@ impl Character {
     pub fn save(&self) -> Result<SavedCharacter> {
         let mut story_tags = IndexMap::new();
         for (tag, value) in self.story_tags.iter() {
-            story_tags.insert(tag.to_string(), value.into());
+            story_tags.insert(tag.0.display(), value.into());
         }
         let mut stacks = Vec::new();
         for stack in &self.inventory {

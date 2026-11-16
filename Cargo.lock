@@ -857,7 +857,7 @@ dependencies = [
 [[package]]
 name = "formulas"
 version = "1.0.0"
-source = "git+https://github.com/Hayen03/formulas.git#fe7d9bc9ee7ef73f4eaee1d27172df8f0ca6eafa"
+source = "git+https://github.com/Hayen03/formulas.git#1f852573bfcc0f1fe804dca7db7dac037fb6bb10"
 dependencies = [
  "indexmap",
  "rand 0.10.4",

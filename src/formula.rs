@@ -47,13 +47,13 @@ pub fn mk_character_view(character: &Character, formula: &mut FormulaEngine, env
         .collect::<Result<IndexMap<EvalKey, EvalValue>>>()?;
 
     let mut map = IndexMap::new();
-    map.insert(EvalKey(EvalValue::from("name")), name);
+    map.insert(EvalKey(EvalValue::from("nom")), name);
     map.insert(EvalKey(EvalValue::from("max_pv")), max_pv);
     map.insert(EvalKey(EvalValue::from("pv")), pv);
     map.insert(EvalKey(EvalValue::from("max_moral")), max_moral);
     map.insert(EvalKey(EvalValue::from("moral")), moral);
     map.insert(EvalKey(EvalValue::from("attributs")), EvalValue::Object(attrs.into()));
-    map.insert(EvalKey(EvalValue::from("items")), EvalValue::Array(items.into()));
+    map.insert(EvalKey(EvalValue::from("objets")), EvalValue::Array(items.into()));
     map.insert(EvalKey(EvalValue::from("etats")), EvalValue::Array(etats.into()));
     map.insert(EvalKey(EvalValue::from("tags")), EvalValue::Object(tags.into()));
 
@@ -88,13 +88,13 @@ pub fn mk_partial_character_view(character: &Character) -> Result<EvalValue> {
         .collect::<Result<IndexMap<EvalKey, EvalValue>>>()?;
 
     let mut map = IndexMap::new();
-    map.insert(EvalKey(EvalValue::from("name")), name);
+    map.insert(EvalKey(EvalValue::from("nom")), name);
     map.insert(EvalKey(EvalValue::from("max_pv")), max_pv);
     map.insert(EvalKey(EvalValue::from("pv")), pv);
     map.insert(EvalKey(EvalValue::from("max_moral")), max_moral);
     map.insert(EvalKey(EvalValue::from("moral")), moral);
     map.insert(EvalKey(EvalValue::from("attributs")), EvalValue::Object(attrs.into()));
-    map.insert(EvalKey(EvalValue::from("items")), EvalValue::Array(items.into()));
+    map.insert(EvalKey(EvalValue::from("objets")), EvalValue::Array(items.into()));
     map.insert(EvalKey(EvalValue::from("etats")), EvalValue::Array(etats.into()));
     map.insert(EvalKey(EvalValue::from("tags")), EvalValue::Object(tags.into()));
 
@@ -141,7 +141,21 @@ pub fn mk_character_env(character: &Character, formula: &mut FormulaEngine, env:
         .collect::<Result<IndexMap<EvalKey, EvalValue>>>()?;
 
     let mut envmap = IndexMap::new();
-    envmap.insert("name".into(), name.clone());
+
+    for (tag, val) in tags.iter() {
+        let EvalKey(EvalValue::String(tag)) = tag else {
+            bail!("Expected tag to be a string");
+        };
+        envmap.insert(tag.clone(), val.clone());
+    }
+    for (attr, val) in attrs.iter() {
+        let EvalKey(EvalValue::String(attr)) = attr else {
+            bail!("Expected attribute key to be a string");
+        };
+        envmap.insert(attr.clone(), val.clone());
+    }
+
+    envmap.insert("nom".into(), name.clone());
     envmap.insert("max_pv".into(), max_pv.clone());
     envmap.insert("pv".into(), pv.clone());
     envmap.insert("max_moral".into(), max_moral.clone());
@@ -152,7 +166,7 @@ pub fn mk_character_env(character: &Character, formula: &mut FormulaEngine, env:
     envmap.insert("tags".into(), EvalValue::Object(tags.clone().into()));
 
     let mut map = IndexMap::new();
-    map.insert(EvalKey(EvalValue::from("name")), name);
+    map.insert(EvalKey(EvalValue::from("nom")), name);
     map.insert(EvalKey(EvalValue::from("max_pv")), max_pv);
     map.insert(EvalKey(EvalValue::from("pv")), pv);
     map.insert(EvalKey(EvalValue::from("max_moral")), max_moral);
@@ -181,7 +195,7 @@ pub fn mk_partial_character_env(character: &Character) -> Result<Env<'static>> {
         bail!("Expected partial character view to be an object");
     };
 
-    let name = partial.get(&EvalKey("name".into())).ok_or_else(|| anyhow!("Name missing from partial character view"))?;
+    let name = partial.get(&EvalKey("nom".into())).ok_or_else(|| anyhow!("Name missing from partial character view"))?;
     let max_pv = partial.get(&EvalKey("max_pv".into())).ok_or_else(|| anyhow!("Max PV missing from partial character view"))?;
     let pv = partial.get(&EvalKey("pv".into())).ok_or_else(|| anyhow!("PV missing from partial character view"))?;
     let max_moral = partial.get(&EvalKey("max_moral".into())).ok_or_else(|| anyhow!("Max morale missing from partial character view"))?;
@@ -279,14 +293,29 @@ pub fn mk_item_env(character_env: &Env, item_idx: usize) -> Result<Env<'static>>
     let EvalValue::Object(item) = items.get(item_idx).ok_or_else(|| anyhow!("Index d'objet invalide"))? else {
         bail!("L'objet à l'index donné n'est pas un objet");
     };
-    
+
+    let donnees = item.get(&EvalKey(EvalValue::from("donnees"))).ok_or_else(|| anyhow!("L'objet n'a pas de donnees"))?.clone();
+
     let mut envmap: IndexMap<Arc<str>, EvalValue> = IndexMap::new();
+
+    if let EvalValue::Object(data) = &donnees {
+        for (cle, val) in data.iter() {
+            let EvalKey(EvalValue::String(cle)) = cle else {
+                bail!("La clé des donnees n'est pas une chaîne");
+            };
+            envmap.insert(cle.clone(), val.clone());
+        }
+    } else {
+        bail!("Les donnees de l'objet ne sont pas un dict");
+    }
+    
+    envmap.insert("id".into(), item.get(&EvalKey(EvalValue::from("id"))).ok_or_else(|| anyhow!("L'objet n'a pas d'id"))?.clone());
     envmap.insert(Arc::from("objet"), EvalValue::Object(item.clone()));
     envmap.insert(Arc::from("nom"), item.get(&EvalKey(EvalValue::from("nom"))).ok_or_else(|| anyhow!("L'objet n'a pas de nom"))?.clone());
     envmap.insert(Arc::from("description"), item.get(&EvalKey(EvalValue::from("description"))).ok_or_else(|| anyhow!("L'objet n'a pas de description"))?.clone());
     envmap.insert(Arc::from("quantite"), item.get(&EvalKey(EvalValue::from("quantite"))).ok_or_else(|| anyhow!("L'objet n'a pas de quantite"))?.clone());
     envmap.insert(Arc::from("traits"), item.get(&EvalKey(EvalValue::from("traits"))).ok_or_else(|| anyhow!("L'objet n'a pas de traits"))?.clone());
-    envmap.insert(Arc::from("donnees"), item.get(&EvalKey(EvalValue::from("donnees"))).ok_or_else(|| anyhow!("L'objet n'a pas de donnees"))?.clone());
+    envmap.insert(Arc::from("donnees"), donnees);
 
     Ok(Env::from_index_map(&Arc::new(envmap)))
 }
@@ -323,6 +352,19 @@ pub fn mk_partial_item_env(item: &ItemStack) -> Result<Env<'static>> {
     let data = view_map.get(&EvalKey(EvalValue::String("donnees".into()))).ok_or_else(|| anyhow!("La vue partielle de l'objet ne contient pas de donnees"))?;
 
     let mut env = Env::new();
+
+    if let EvalValue::Object(data) = data {
+        for (cle, val) in data.iter() {
+            let EvalKey(EvalValue::String(cle)) = cle else {
+                bail!("La clé des donnees n'est pas une chaîne");
+            };
+            env.insert(cle.clone(), val.clone());
+        }
+    } else {
+        bail!("Les donnees de l'objet ne sont pas un dict");
+    }
+
+    env.insert("id", EvalValue::from(item.item.id.clone()));
     env.insert("nom", name.clone());
     env.insert("description", description.clone());
     env.insert("traits", traits.clone());
@@ -360,6 +402,14 @@ pub fn mk_new_item_env(item: &ItemStack, formula: &mut FormulaEngine, env: &Env)
     map.insert(EvalKey(EvalValue::from("donnees")), EvalValue::Object(data.clone()));
 
     let mut env = Env::new();
+
+    for (cle, val) in data.iter() {
+        let EvalKey(EvalValue::String(cle)) = cle else {
+            bail!("La clé des donnees n'est pas une chaîne");
+        };
+        env.insert(cle.clone(), val.clone());
+    }
+
     env.insert("id", id.into());
     env.insert("nom", name.into());
     env.insert("description", description.into());
@@ -384,17 +434,7 @@ pub fn mk_condition_view(condition: &ConditionInstance, formula: &mut FormulaEng
     let id = condition.template.id.clone();
     let name = condition.actual_name(formula, &env)?;
     let description = condition.actual_description(formula, &env)?;
-    let traits: Vec<EvalValue> = condition.template.traits.iter()
-        .map(|t| {
-            match t {
-                Deferred::Literal(lit) => Ok(lit.clone().into()),
-                Deferred::Formula(form) => {
-                    form.clone().call(&[], formula, &env)
-                        .map_err(|err| anyhow!("Erreur évaluant le trait différé: {}", err))
-                },
-            }
-        })
-        .collect::<Result<Vec<EvalValue>>>()?;
+    let traits: Arc<[EvalValue]> = eval_traits(&condition.template.traits, formula, &env)?;
     let data: IndexMap<EvalKey, EvalValue> = Arc::unwrap_or_clone(condition.actual_data())
         .into_iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -410,7 +450,7 @@ pub fn mk_condition_view(condition: &ConditionInstance, formula: &mut FormulaEng
     Ok(EvalValue::Object(map.into()))
 }
 /// Create a partial view of a condition for formula evaluation.
-/// Does not evaluate deferred traits, name, description, or data; only includes literal values.
+/// Does not evaluate deferred traits, name, description, or data; only includes litxeral values.
 pub fn mk_partial_condition_view(condition: &ConditionInstance) -> Result<EvalValue> {
     let id = condition.template.id.clone();
     let name = condition.template.name.clone();
@@ -451,12 +491,26 @@ pub fn mk_condition_env(character_env: &Env, item_idx: usize) -> Result<Env<'sta
     let EvalValue::Object(condition) = conditions.get(item_idx).ok_or_else(|| anyhow!("Index d'état invalide"))? else {
         bail!("L'état à l'index donné n'est pas un objet");
     };
-    
+
+    let donnees = condition.get(&EvalKey(EvalValue::from("donnees"))).ok_or_else(|| anyhow!("L'état n'a pas de donnees"))?.clone();
+
     let mut envmap: IndexMap<Arc<str>, EvalValue> = IndexMap::new();
+
+    if let EvalValue::Object(data) = &donnees {
+        for (cle, val) in data.iter() {
+            let EvalKey(EvalValue::String(cle)) = cle else {
+                bail!("La clé des donnees n'est pas une chaîne");
+            };
+            envmap.insert(cle.clone(), val.clone());
+        }
+    } else {
+        bail!("Les donnees de l'état ne sont pas un dict");
+    }
+    
+    envmap.insert("id".into(), condition.get(&EvalKey(EvalValue::from("id"))).ok_or_else(|| anyhow!("L'état n'a pas d'id"))?.clone());
     envmap.insert(Arc::from("etat"), EvalValue::Object(condition.clone()));
     envmap.insert(Arc::from("nom"), condition.get(&EvalKey(EvalValue::from("nom"))).ok_or_else(|| anyhow!("L'état n'a pas de nom"))?.clone());
     envmap.insert(Arc::from("description"), condition.get(&EvalKey(EvalValue::from("description"))).ok_or_else(|| anyhow!("L'état n'a pas de description"))?.clone());
-    envmap.insert(Arc::from("quantite"), condition.get(&EvalKey(EvalValue::from("quantite"))).ok_or_else(|| anyhow!("L'état n'a pas de quantite"))?.clone());
     envmap.insert(Arc::from("traits"), condition.get(&EvalKey(EvalValue::from("traits"))).ok_or_else(|| anyhow!("L'état n'a pas de traits"))?.clone());
     envmap.insert(Arc::from("donnees"), condition.get(&EvalKey(EvalValue::from("donnees"))).ok_or_else(|| anyhow!("L'état n'a pas de donnees"))?.clone());
 
@@ -496,6 +550,19 @@ pub fn mk_partial_condition_env(condition: &ConditionInstance) -> Result<Env<'st
     let data = view_map.get(&EvalKey(EvalValue::String("donnees".into()))).ok_or_else(|| anyhow!("La vue partielle de l'objet ne contient pas de donnees"))?;
 
     let mut env = Env::new();
+
+    if let EvalValue::Object(data) = data {
+        for (cle, val) in data.iter() {
+            let EvalKey(EvalValue::String(cle)) = cle else {
+                bail!("La clé des donnees n'est pas une chaîne");
+            };
+            env.insert(cle.clone(), val.clone());
+        }
+    } else {
+        bail!("Les donnees de l'état ne sont pas un dict");
+    }
+
+    env.insert("id", condition.template.id.clone().into());
     env.insert("nom", name.clone());
     env.insert("description", description.clone());
     env.insert("traits", traits.clone());
@@ -515,17 +582,7 @@ pub fn mk_new_condition_env(condition: &ConditionInstance, formula: &mut Formula
     let id = condition.template.id.clone();
     let name = condition.actual_name(formula, &env)?;
     let description = condition.actual_description(formula, &env)?;
-    let traits: Vec<EvalValue> = condition.template.traits.iter()
-        .map(|t| {
-            match t {
-                Deferred::Literal(lit) => Ok(lit.clone().into()),
-                Deferred::Formula(form) => {
-                    form.clone().call(&[], formula, &env)
-                        .map_err(|err| anyhow!("Erreur évaluant le trait différé: {}", err))
-                },
-            }
-        })
-        .collect::<Result<Vec<EvalValue>>>()?;
+    let traits: Arc<[EvalValue]> = eval_traits(&condition.template.traits, formula, &env)?;
     let data: IndexMap<EvalKey, EvalValue> = Arc::unwrap_or_clone(condition.actual_data())
         .into_iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -535,6 +592,14 @@ pub fn mk_new_condition_env(condition: &ConditionInstance, formula: &mut Formula
     let data = Arc::from(data);
 
     let mut env = Env::new();
+
+    for (cle, val) in data.iter() {
+        let EvalKey(EvalValue::String(cle)) = cle else {
+            bail!("La clé des donnees n'est pas une chaîne");
+        };
+        env.insert(cle.clone(), val.clone());
+    }
+
     env.insert("id", EvalValue::from(id.clone()));
     env.insert("nom", EvalValue::from(name.clone()));
     env.insert("description", EvalValue::from(description.clone()));

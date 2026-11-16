@@ -5,6 +5,7 @@
 //! against a runtime environment.
 use crate::character::Character;
 use crate::effects::{Cell, ConditionEffect, Deferred, PageEffect};
+use crate::engine::CAPTURE_IGNORE;
 use crate::filters::{ConditionFilter, Conditional};
 use crate::formula::{dict_to_map, json_to_eval_value, mk_character_env, mk_connection_env, mk_partial_condition_env, mk_partial_item_env, mk_tale_env};
 use formulas::{
@@ -424,14 +425,11 @@ fn parse_global_values(value: Option<&JsonValue>) -> Result<IndexMap<Arc<str>, E
         })
         .collect::<Result<IndexMap<_, _>>>()?;
     let mut values = raw.clone();
-    let mut formula = FormulaEngine::new(None);
+    let mut formula = FormulaEngine::new(None)
+        .with_capture_ignore(CAPTURE_IGNORE.iter().map(|s| Arc::from(*s)).collect());
 
     for (key, value) in raw.iter() {
-        let mut env = mk_tale_env(&values)?;
-        let map = values.iter()
-            .map(|(k, v)| (EvalKey(EvalValue::String(k.clone().into())), v.clone()))
-            .collect::<IndexMap<_, _>>();
-        env.insert("recit", EvalValue::Object(Arc::new(map)));
+        let env = mk_tale_env(&values)?;
         let resolved = resolve_global_value(value, &mut formula, &env)
             .with_context(|| format!("Valeur globale `{key}` invalide"))?;
         values.insert(key.clone(), resolved);
@@ -1577,7 +1575,7 @@ impl Connection {
                 .context("Erreur lors de l'évaluation de la destination d'une connexion")?,
             _ => self.resolved_destination(formula, &selection_env)?,
         };
-        let connection_env = mk_connection_env(self, formula, env)
+        let connection_env = mk_connection_env(self, formula, &selection_env)
             .context("Évaluation des tags de la connexion sélectionnée")?;
 
         Ok(PageResult {
@@ -1981,7 +1979,7 @@ mod global_tests {
             "titre": "Fermetures globales",
             "depart": "debut",
             "global": {
-                "lire_plus_tard": "${fn -> valeur_tardive}",
+                "lire_plus_tard": "${fn -> recit.valeur_tardive}",
                 "valeur_tardive": "${20 + 1}",
                 "lire_masque": "${let valeur_tardive = 7 for fn -> valeur_tardive}"
             },
@@ -2013,7 +2011,7 @@ mod global_tests {
             "version": 2,
             "depart": "debut",
             "images": {
-                "connue": {"type": "chemin", "chemin": "connue.png"}
+                "connue": {"type": "fichier", "chemin": "connue.png"}
             },
             "image": ["connue", "couverture_absente"],
             "pages": {

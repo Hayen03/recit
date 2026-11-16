@@ -2329,6 +2329,7 @@ impl PageEffect {
         let mut death_page = None;
         //let base_env = env.merged(&character.env());
         let mut notifs = Vec::new();
+        let old_charenv = mk_character_env(character, formula, &env)?;
         for (removed_count, original_index) in indices.into_iter().enumerate() {
             let index = original_index - removed_count;
             let condition = character.conditions.remove(index);
@@ -2336,7 +2337,7 @@ impl PageEffect {
             character.fix_hp(formula, &env)?;
             character.fix_morale(formula, &env)?;
             let charenv = mk_character_env(character, formula, &env)?;
-            let nenv = condition_notification_env(&charenv, index, &base_env)?;
+            let nenv = condition_notification_env(&old_charenv, original_index, &base_env)?;
             let nenv = charenv
                 .expand(nenv);
             let notif = notification
@@ -2468,7 +2469,7 @@ impl PageEffect {
         //let base_env = env.merged(&character.env());
         let mut notifs = Vec::new();
         for index in indices {
-            let (old_value, stack_qt, removed, name, suffix) = {
+            let (old_value, new_qt, removed, name, suffix) = {
                 let stack = &mut character.inventory[index];
                 let env = mk_partial_item_env(&stack)
                     .with_context(|| "Erreur en construisant l'environement d'objet dans effet 'retirer objet'")?
@@ -2485,13 +2486,13 @@ impl PageEffect {
                 let mut removed_stack = stack.clone();
                 removed_stack.quantity = removed;
                 stack.quantity -= removed;
-                (old_value, stack.quantity, removed, name, suffix)
+                (old_value, old_value - removed, removed, name, suffix)
             };
             let charenv = mk_character_base_env(character, formula, oenv)?;
             let nenv = item_notification_env(&charenv, index, &base_env)?;
             let mut nenv = charenv.expand(nenv);
             nenv.insert("ancienne", EvalValue::Int(old_value));
-            nenv.insert("valeur", EvalValue::Int(stack_qt));
+            nenv.insert("valeur", EvalValue::Int(new_qt));
             nenv.insert("retires", EvalValue::Int(removed));
             let notif = notification
                 .as_ref()
